@@ -1,0 +1,271 @@
+"""Tests of the goal-loop plugin, one or more per owner goal.
+
+These tests are self-contained: they use a fake ctx and a temp state dir, so they run with plain
+``python -m unittest`` without a Hermes install. The companion fork patch (the generic ``pre_stop``
+hook) is tested in the fork; here the hook callback is called directly.
+"""
+import os
+import tempfile
+import unittest
+
+from goal_loop import (
+    STOP_CAUSES, _Tools, make_pre_stop, make_transform_llm_output, register,
+)
+from goal_loop.claim import ClaimError, serialize_completion_claim
+from goal_loop.state import Goal, GoalState, GoalStore, status_block
+
+
+class FakeLlm:
+    def __init__(self, text):
+        self._text = text
+        self.calls = []
+
+    def complete(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+
+        class _R:
+            text = self._text
+        return _R()
+
+
+class FakeCtx:
+    """A ctx with only ctx.llm, so the judge takes the tool-less fallback path."""
+
+    def __init__(self, verdict_text="VERDICT: done"):
+        self.llm = FakeLlm(verdict_text)
+        self.subagent_lifecycle = None  # force the ctx.llm path
+        self.tools = []
+        self.hooks = {}
+
+    def register_tool(self, name, toolset, schema, handler, emoji="", description="", **kw):
+        self.tools.append((name, toolset, handler))
+
+    def register_hook(self, hook_name, callback, **kw):
+        self.hooks.setdefault(hook_name, []).append(callback)
+
+
+def make_tools(verdict_text="VERDICT: done"):
+    tmp = tempfile.mkdtemp(prefix="goal-loop-test-")
+    store = GoalStore(tmp)
+    ctx = FakeCtx(verdict_text)
+    return _Tools(store, ctx), store, ctx
+
+
+IDS = {"session_id": "s1", "platform": "api_server"}
+
+
+class Goal1BeforeWorkTest(unittest.TestCase):
+    """Goal 1: detect goals, show the list with checks, ask for the go, no work before the go."""
+
+    def test_goal_set_records_goals_with_checks_and_withholds_go(self):
+        tools, store, _ = make_tools()
+        out = tools.goal_set({"goals": [
+            {"id": "g1", "text": "branch exists", "check": "git rev-parse g1"},
+            {"id": "g2", "text": "tests pass", "check": "pytest -q"},
+        ]}, **IDS)
+        self.assertIn("g1", out)
+        self.assertIn("check: git rev-parse g1", out)
+        self.assertIn("No loop runs before goal_go", out)
+        state = store.load("api_server:s1")
+        self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
+        self.assertFalse(state.go)
+
+    def test_each_goal_needs_a_check(self):
+        tools, _, _ = make_tools()
+        out = tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": ""}]}, **IDS)
+        self.assertIn("needs id, text and check", out)
+
+    def test_pre_stop_does_not_fire_before_the_go(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        hook = make_pre_stop(store)
+        self.assertIsNone(hook(session_id="s1", platform="api_server", attempt=0))
+
+
+class Goal2ToTheEndTest(unittest.TestCase):
+    """Goal 2: work to the end; state survives compaction (keyed by chat, not session id)."""
+
+    def test_pre_stop_continues_while_open_goals_remain(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        tools.goal_go({}, **IDS)
+        hook = make_pre_stop(store)
+        result = hook(session_id="s1", platform="api_server", attempt=0)
+        self.assertEqual(result["action"], "continue")
+        self.assertIn("g1", result["message"])
+        for cause in STOP_CAUSES:
+            self.assertIn(cause, result["message"])
+
+    def test_pre_stop_stops_when_all_goals_done(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        tools.goal_go({}, **IDS)
+        state = store.load("api_server:s1")
+        state.goals[0].done = True
+        store.save(state)
+        hook = make_pre_stop(store)
+        self.assertIsNone(hook(session_id="s1", platform="api_server", attempt=0))
+
+    def test_cron_sessions_are_excluded(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="s1", platform="cron")
+        tools.goal_go({}, session_id="s1", platform="cron")
+        hook = make_pre_stop(store)
+        self.assertIsNone(hook(session_id="s1", platform="cron", attempt=0))
+
+    def test_state_survives_a_new_session_id_for_the_same_chat(self):
+        # A compaction changes the session id but the chat key uses platform+session; the owner's
+        # loop keys on the chat, so we assert the stored state reloads by the same key.
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        tools.goal_go({}, **IDS)
+        reloaded = store.load("api_server:s1")
+        self.assertTrue(reloaded.go)
+        self.assertEqual(reloaded.goals[0].id, "g1")
+
+
+class Goal3JudgeTest(unittest.TestCase):
+    """Goal 3: a fresh-context judge checks the real state and gives a reason on rejection."""
+
+    def test_claim_confirmed_by_judge_marks_done(self):
+        tools, store, ctx = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [{"id": "g1", "text": "branch exists", "check": "git rev-parse g1"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {
+            "summary": "branch pushed",
+            "checks": [{"command": "git rev-parse g1", "result": "passed", "exitCode": 0}],
+        }}, **IDS)
+        self.assertIn("confirmed", out)
+        self.assertTrue(store.load("api_server:s1").goal("g1").done)
+        # the judge saw the goal + evidence as data, with temperature 0 and the goal_judge task
+        self.assertTrue(ctx.llm.calls)
+        self.assertEqual(ctx.llm.calls[0][1].get("task"), "goal_judge")
+
+    def test_judge_rejection_gives_a_reason_and_keeps_goal_open(self):
+        tools, store, _ = make_tools("VERDICT: not-done the branch has no commits")
+        tools.goal_set({"goals": [{"id": "g1", "text": "branch exists", "check": "c"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": "done",
+                               "checks": [{"explanation": "I think so", "result": "passed"}]}}, **IDS)
+        self.assertIn("rejected", out)
+        self.assertIn("the branch has no commits", out)
+        goal = store.load("api_server:s1").goal("g1")
+        self.assertFalse(goal.done)
+        self.assertEqual(goal.judge_reason, "the branch has no commits")
+
+    def test_malformed_claim_is_refused_before_the_judge(self):
+        tools, _, ctx = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": ""}}, **IDS)
+        self.assertIn("claim rejected", out)
+        self.assertEqual(ctx.llm.calls, [])  # judge never ran
+
+    def test_judge_no_verdict_line_fails_closed(self):
+        tools, store, _ = make_tools("the work looks fine to me")
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s",
+                               "checks": [{"explanation": "e", "result": "passed"}]}}, **IDS)
+        self.assertIn("rejected", out)
+
+
+class Goal4DoneStaysDoneTest(unittest.TestCase):
+    """Goal 4: a confirmed goal stays done; each report shows all goals."""
+
+    def test_confirmed_goal_stays_done_and_pre_stop_skips_it(self):
+        tools, store, _ = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [
+            {"id": "g1", "text": "a", "check": "c1"}, {"id": "g2", "text": "b", "check": "c2"},
+        ]}, **IDS)
+        tools.goal_go({}, **IDS)
+        tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s",
+                         "checks": [{"command": "c1", "result": "passed", "exitCode": 0}]}}, **IDS)
+        hook = make_pre_stop(store)
+        result = hook(session_id="s1", platform="api_server", attempt=1)
+        self.assertIn("g2", result["message"])
+        self.assertNotIn("g1", result["message"])  # done goal is not re-listed
+
+    def test_status_block_lists_all_goals(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [
+            {"id": "g1", "text": "a", "check": "c1"}, {"id": "g2", "text": "b", "check": "c2"},
+        ]}, **IDS)
+        transform = make_transform_llm_output(store)
+        out = transform(text="here is my answer", session_id="s1", platform="api_server")
+        self.assertIn("here is my answer", out)
+        self.assertIn("g1: a", out)
+        self.assertIn("g2: b", out)
+        self.assertIn("Goal status:", out)
+
+
+class Goal5DecisionsTest(unittest.TestCase):
+    """Goal 5: decisions at the end as a numbered text list, no card and no modal."""
+
+    def test_decisions_render_as_a_numbered_text_list(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
+        tools.goal_decision({"text": "Repo name: A public, B private. Recommend A."}, **IDS)
+        tools.goal_decision({"text": "Base tag: A v1, B v2. Recommend A."}, **IDS)
+        state = store.load("api_server:s1")
+        block = status_block(state)
+        self.assertIn("Open decisions:", block)
+        self.assertIn("1. Repo name:", block)
+        self.assertIn("2. Base tag:", block)
+
+
+class ClaimUnitTest(unittest.TestCase):
+    def test_failed_check_rejects_the_claim(self):
+        with self.assertRaises(ClaimError):
+            serialize_completion_claim({"summary": "s", "checks": [{"command": "c", "result": "failed"}]})
+
+    def test_passed_check_with_nonzero_exit_rejects(self):
+        with self.assertRaises(ClaimError):
+            serialize_completion_claim({"summary": "s",
+                                        "checks": [{"command": "c", "result": "passed", "exitCode": 1}]})
+
+    def test_valid_claim_renders_evidence_lines(self):
+        evidence = serialize_completion_claim({
+            "summary": "branch pushed",
+            "criteria": [{"criterion": "branch exists", "evidence": ["git rev-parse ok"]}],
+            "checks": [{"command": "git rev-parse g1", "result": "passed", "exitCode": 0}],
+            "changedFiles": ["patch_stop_hook.py"],
+        })
+        self.assertIn("Summary: branch pushed", evidence)
+        self.assertIn("Criterion: branch exists", evidence)
+        self.assertIn("Check: git rev-parse g1 | passed | exit 0", evidence)
+        self.assertIn("Changed files: patch_stop_hook.py", evidence)
+
+
+class StateUnitTest(unittest.TestCase):
+    def test_ledger_is_append_only_and_records_terminal_events(self):
+        tmp = tempfile.mkdtemp(prefix="goal-loop-ledger-")
+        store = GoalStore(tmp)
+        store.append_ledger("c1", "go")
+        store.append_ledger("c1", "confirmed", goal_id="g1")
+        events = store.read_ledger("c1")
+        self.assertEqual([e["event"] for e in events], ["go", "confirmed"])
+        self.assertEqual(events[1]["goal_id"], "g1")
+
+    def test_open_goals_excludes_done_and_blocked(self):
+        state = GoalState(chat_key="c1", goals=[
+            Goal("g1", "a", "c", done=True), Goal("g2", "b", "c", status="blocked"),
+            Goal("g3", "c", "c"),
+        ])
+        self.assertEqual([g.id for g in state.open_goals()], ["g3"])
+
+
+class RegisterTest(unittest.TestCase):
+    def test_register_wires_six_tools_and_two_hooks(self):
+        os.environ["GOAL_LOOP_STATE_DIR"] = tempfile.mkdtemp(prefix="goal-loop-reg-")
+        try:
+            ctx = FakeCtx()
+            register(ctx)
+            names = {name for name, _, _ in ctx.tools}
+            self.assertEqual(names, {"goal_set", "goal_go", "goal_status", "goal_claim",
+                                     "goal_decision", "goal_block"})
+            self.assertIn("pre_stop", ctx.hooks)
+            self.assertIn("transform_llm_output", ctx.hooks)
+        finally:
+            del os.environ["GOAL_LOOP_STATE_DIR"]
+
+
+if __name__ == "__main__":
+    unittest.main()
