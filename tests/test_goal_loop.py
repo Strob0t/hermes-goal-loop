@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from goal_loop import (
-    FINAL_REPORT_NUDGE, STOP_CAUSES, _Tools, _chat_key, make_pre_stop,
+    FINAL_REPORT_NUDGE, NO_REPORT_MARKER, STOP_CAUSES, _Tools, _chat_key, make_pre_stop,
     make_transform_llm_output, register,
 )
 from goal_loop.judge import JUDGE_TOOLSETS, run_judge
@@ -192,8 +192,19 @@ class F5FinalReportTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         transform = make_transform_llm_output(store)
-        out = transform(text="   ", session_id="s1", platform="api_server")
-        self.assertIn("no final report from the model", out)
+        # the live field is response_text; empty response_text -> the marker shows
+        out = transform(response_text="   ", session_id="s1", platform="api_server")
+        self.assertIn(NO_REPORT_MARKER, out)
+
+    def test_transform_keeps_the_models_real_answer(self):
+        # F6: the model's text arrives as response_text and must be preserved, not overwritten
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        transform = make_transform_llm_output(store)
+        out = transform(response_text="REPORT: g1 done", session_id="s1", platform="api_server")
+        self.assertTrue(out.startswith("REPORT: g1 done"))
+        self.assertIn("Goal status:", out)
+        self.assertNotIn(NO_REPORT_MARKER, out)
 
 
 class F4JudgeToolsetTest(unittest.TestCase):

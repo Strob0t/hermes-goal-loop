@@ -23,6 +23,9 @@ import tempfile
 import unittest
 
 # Real Hermes modules (the patched copy, because cwd is its root):
+from types import SimpleNamespace
+
+from agent.turn_finalizer import apply_llm_output_transform
 from agent.turn_stop_gates import apply_stop_gates
 from hermes_cli import plugins as plugins_facade
 from hermes_cli.plugins import PluginManager
@@ -156,6 +159,17 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         verdict, messages = run_stop_gate(agent)
         self.assertTrue(verdict.continue_turn)              # the hook found the tool's state
         self.assertIn("g1", messages[-1]["content"])
+
+    def test_real_finalizer_keeps_model_text_and_appends_status(self):
+        # F6: the real fork caller passes the model answer as response_text; the status block must
+        # be appended, not substituted for the answer.
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        agent = SimpleNamespace(session_id="it-sess", model="m", platform="local")
+        final, transformed, _ = apply_llm_output_transform(agent, "MODEL REPORT", turn_id="t1")
+        self.assertTrue(transformed)
+        self.assertIn("MODEL REPORT", final)
+        self.assertIn("Goal status:", final)
+        self.assertNotIn("(no final report from the model)", final)
 
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)

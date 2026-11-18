@@ -43,6 +43,10 @@ FINAL_REPORT_NUDGE = (
     "list each goal, the judge result, and the evidence (including the file content)."
 )
 
+# Shown (before the status block) only when the model's own turn text is truly empty, so a missing
+# owner report stays visible instead of being masked by the status block (F5/F6).
+NO_REPORT_MARKER = "(no final report from the model)"
+
 
 def _state_dir() -> str:
     return os.environ.get(_STATE_DIR_ENV) or _DEFAULT_STATE_DIR
@@ -300,7 +304,13 @@ def make_pre_stop(store: GoalStore):
 def make_transform_llm_output(store: GoalStore):
     """Append the goal status block to each final answer (goal 4)."""
 
-    def _transform(text: str = "", session_id: str = "", platform: str = "", **_: Any) -> Optional[str]:
+    def _transform(response_text: str = "", text: str = "", session_id: str = "",
+                   platform: str = "", **_: Any) -> Optional[str]:
+        # The fork passes the model's answer as ``response_text`` (agent/turn_finalizer.py
+        # apply_llm_output_transform); ``text`` is a fallback only, never the live field (F6). A
+        # wrong field name here would make the status block OVERWRITE the model's real answer, since
+        # the fork takes the first non-empty string the hook returns.
+        body = response_text if isinstance(response_text, str) and response_text else text
         try:
             state = store.load(_chat_key(session_id))
         except Exception:
@@ -308,13 +318,13 @@ def make_transform_llm_output(store: GoalStore):
         if not state.goals:
             return None
         block = status_block(state)
-        if not block or not isinstance(text, str):
+        if not block or not isinstance(body, str):
             return None
         # F5: keep an empty model turn visible instead of hiding it behind the status block, so a
         # missing owner report is not silently masked.
-        if not text.strip():
-            return "(no final report from the model)\n" + block
-        return text + "\n" + block
+        if not body.strip():
+            return NO_REPORT_MARKER + "\n" + block
+        return body + "\n" + block
 
     return _transform
 
