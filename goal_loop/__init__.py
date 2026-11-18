@@ -40,9 +40,13 @@ def _state_dir() -> str:
     return os.environ.get(_STATE_DIR_ENV) or _DEFAULT_STATE_DIR
 
 
-def _chat_key(session_id: str, platform: str) -> str:
-    """Key state by chat, not by session id (the session id changes on compaction)."""
-    return f"{platform or 'api'}:{session_id or 'default'}"
+def _chat_key(session_id: str) -> str:
+    """Key state by chat. Uses ``session_id`` only and never ``platform``: the dispatcher passes
+    ``session_id``/``conversation_id`` to tool handlers but not ``platform`` (#68318), while the
+    pre_stop hook sees ``agent.platform``. A platform-free key is the one both sides can agree on,
+    so a tool and the hook read the same file. (``conversation_id`` would also survive compaction;
+    moving both sides to it is tracked separately.)"""
+    return f"chat:{session_id or 'default'}"
 
 
 # --- Tool schemas -----------------------------------------------------------------------------
@@ -144,7 +148,7 @@ class _Tools:
 
     @staticmethod
     def _ids(kwargs: dict) -> str:
-        return _chat_key(str(kwargs.get("session_id") or ""), str(kwargs.get("platform") or ""))
+        return _chat_key(str(kwargs.get("session_id") or ""))
 
     def goal_set(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self.store.load(self._ids(kwargs))
@@ -254,7 +258,7 @@ def make_pre_stop(store: GoalStore):
     def _pre_stop(session_id: str = "", platform: str = "", attempt: int = 0,
                   final_response: str = "", **_: Any) -> Optional[dict]:
         try:
-            state = store.load(_chat_key(session_id, platform))
+            state = store.load(_chat_key(session_id))
         except Exception:
             logger.debug("pre_stop state load failed", exc_info=True)
             return None
@@ -285,7 +289,7 @@ def make_transform_llm_output(store: GoalStore):
 
     def _transform(text: str = "", session_id: str = "", platform: str = "", **_: Any) -> Optional[str]:
         try:
-            state = store.load(_chat_key(session_id, platform))
+            state = store.load(_chat_key(session_id))
         except Exception:
             return None
         if not state.goals:
@@ -320,8 +324,15 @@ def register(ctx) -> None:
          "Mark a goal blocked so the loop stops retrying it."),
     )
     for name, schema, handler, emoji, description in specs:
-        ctx.register_tool(name=name, toolset="goal_loop", schema=schema, handler=handler,
-                          emoji=emoji, description=description)
+        # The registry builds each definition as {**entry.schema, "name": ...} and the model reads
+        # function["description"]/function["parameters"] (tools/registry.py get_definitions,
+        # tools/tool_search.py). So the registered schema must be in function form
+        # {name, description, parameters}; a bare parameter schema leaves the model with empty
+        # parameters and no description. Pattern follows plugins/google_meet/tools.py _schema().
+        ctx.register_tool(
+            name=name, toolset="goal_loop",
+            schema={"name": name, "description": description, "parameters": schema},
+            handler=handler, emoji=emoji, description=description)
     ctx.register_hook("pre_stop", make_pre_stop(store))
     ctx.register_hook("transform_llm_output", make_transform_llm_output(store))
     logger.info("goal-loop plugin registered: 6 tools, pre_stop + transform_llm_output hooks")

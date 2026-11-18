@@ -127,6 +127,36 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertIn("g1", nudge["content"])
         self.assertIn("[goal-loop]", nudge["content"])
 
+    def test_registry_exposes_goal_tool_schemas_to_the_model(self):
+        # F1: the model reads function["description"]/function["parameters"] from the registry.
+        # A bare parameter schema would surface empty parameters and no description.
+        from tools.registry import registry
+        names = {"goal_set", "goal_go", "goal_status", "goal_claim", "goal_decision", "goal_block"}
+        defs = {d["function"]["name"]: d["function"]
+                for d in registry.get_definitions(names)}
+        self.assertEqual(set(defs), names)  # all six are registered and retrievable
+        for name, fn in defs.items():
+            self.assertTrue(fn.get("description"), f"{name}: empty description")
+            params = fn.get("parameters") or {}
+            self.assertEqual(params.get("type"), "object", f"{name}: parameters not an object schema")
+        claim = defs["goal_claim"]["parameters"]
+        self.assertEqual(set(claim.get("properties", {})) & {"goal_id", "claim"},
+                         {"goal_id", "claim"})  # the model sees the real claim shape
+        self.assertIn("goal_id", claim.get("required", []))
+        set_props = defs["goal_set"]["parameters"].get("properties", {})
+        self.assertIn("goals", set_props)
+
+    def test_tool_without_platform_and_hook_with_platform_share_state(self):
+        # F2: the dispatcher passes tools session_id/conversation_id but NOT platform (#68318);
+        # the pre_stop hook sees agent.platform. Both must key on the same file or the loop is blind.
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="it-sess")          # no platform, as the dispatcher sends it
+        self.tools.goal_go({}, session_id="it-sess")
+        agent = FakeAgent(session_id="it-sess", platform="local")  # hook side: a real platform
+        verdict, messages = run_stop_gate(agent)
+        self.assertTrue(verdict.continue_turn)              # the hook found the tool's state
+        self.assertIn("g1", messages[-1]["content"])
+
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         # no goal_go
@@ -137,7 +167,7 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
     def test_all_goals_done_lets_the_turn_finish(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         self.tools.goal_go({}, **IDS)
-        state = self.tools.store.load("api_server:it-sess")
+        state = self.tools.store.load(goal_loop._chat_key("it-sess"))
         state.goals[0].done = True
         self.tools.store.save(state)
         agent = FakeAgent(**IDS)

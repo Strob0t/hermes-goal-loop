@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from goal_loop import (
-    STOP_CAUSES, _Tools, make_pre_stop, make_transform_llm_output, register,
+    STOP_CAUSES, _Tools, _chat_key, make_pre_stop, make_transform_llm_output, register,
 )
 from goal_loop.claim import ClaimError, serialize_completion_claim
 from goal_loop.state import Goal, GoalState, GoalStore, status_block
@@ -66,7 +66,7 @@ class Goal1BeforeWorkTest(unittest.TestCase):
         self.assertIn("g1", out)
         self.assertIn("check: git rev-parse g1", out)
         self.assertIn("No loop runs before goal_go", out)
-        state = store.load("api_server:s1")
+        state = store.load(_chat_key("s1"))
         self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
         self.assertFalse(state.go)
 
@@ -100,7 +100,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         tools.goal_go({}, **IDS)
-        state = store.load("api_server:s1")
+        state = store.load(_chat_key("s1"))
         state.goals[0].done = True
         store.save(state)
         hook = make_pre_stop(store)
@@ -114,13 +114,26 @@ class Goal2ToTheEndTest(unittest.TestCase):
         hook = make_pre_stop(store)
         self.assertIsNone(hook(session_id="s1", platform="cron", attempt=0))
 
+    def test_pre_stop_reads_the_state_a_tool_wrote_despite_platform(self):
+        # F2: tools get no platform kwarg (key off session_id only); the hook gets agent.platform.
+        # Both must land on one key, or the loop never sees the goals the tool stored.
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="s1")            # tool call: no platform, as the dispatcher sends it
+        tools.goal_go({}, session_id="s1")
+        hook = make_pre_stop(store)
+        result = hook(session_id="s1", platform="local", attempt=0)  # hook: agent.platform='local'
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "continue")
+        self.assertIn("g1", result["message"])
+
     def test_state_survives_a_new_session_id_for_the_same_chat(self):
-        # A compaction changes the session id but the chat key uses platform+session; the owner's
-        # loop keys on the chat, so we assert the stored state reloads by the same key.
+        # The chat key is platform-free (F2): the dispatcher gives tools no platform, so a
+        # tool and the pre_stop hook must agree on one key. We assert the state reloads by it.
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         tools.goal_go({}, **IDS)
-        reloaded = store.load("api_server:s1")
+        reloaded = store.load(_chat_key("s1"))
         self.assertTrue(reloaded.go)
         self.assertEqual(reloaded.goals[0].id, "g1")
 
@@ -136,7 +149,7 @@ class Goal3JudgeTest(unittest.TestCase):
             "checks": [{"command": "git rev-parse g1", "result": "passed", "exitCode": 0}],
         }}, **IDS)
         self.assertIn("confirmed", out)
-        self.assertTrue(store.load("api_server:s1").goal("g1").done)
+        self.assertTrue(store.load(_chat_key("s1")).goal("g1").done)
         # the judge saw the goal + evidence as data, with temperature 0 and the goal_judge task
         self.assertTrue(ctx.llm.calls)
         self.assertEqual(ctx.llm.calls[0][1].get("task"), "goal_judge")
@@ -148,7 +161,7 @@ class Goal3JudgeTest(unittest.TestCase):
                                "checks": [{"explanation": "I think so", "result": "passed"}]}}, **IDS)
         self.assertIn("rejected", out)
         self.assertIn("the branch has no commits", out)
-        goal = store.load("api_server:s1").goal("g1")
+        goal = store.load(_chat_key("s1")).goal("g1")
         self.assertFalse(goal.done)
         self.assertEqual(goal.judge_reason, "the branch has no commits")
 
@@ -213,7 +226,7 @@ class Goal5DecisionsTest(unittest.TestCase):
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
         tools.goal_decision({"text": "Repo name: A public, B private. Recommend A."}, **IDS)
         tools.goal_decision({"text": "Base tag: A v1, B v2. Recommend A."}, **IDS)
-        state = store.load("api_server:s1")
+        state = store.load(_chat_key("s1"))
         block = status_block(state)
         self.assertIn("Open decisions:", block)
         self.assertIn("1. Repo name:", block)
