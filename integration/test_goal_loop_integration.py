@@ -171,6 +171,31 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertIn("Goal status:", final)
         self.assertNotIn("(no final report from the model)", final)
 
+    def test_state_survives_session_id_rotation_via_conversation_id(self):
+        # F3: goals are set under session A with conversation root C; after a compaction the
+        # session id is B. The patched gate must still continue the turn (the fork now hands
+        # conversation_id to the pre_stop hook; the plugin keys on it).
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="A", conversation_id="C")
+        self.tools.goal_go({}, session_id="A", conversation_id="C")
+        agent = FakeAgent(session_id="B", platform="local")   # rotated session id
+        agent._inherited_conversation_id = "C"                # the stable conversation root
+        verdict, messages = run_stop_gate(agent)
+        self.assertTrue(verdict.continue_turn)
+        self.assertIn("g1", messages[-1]["content"])
+
+    def test_transform_survives_session_id_rotation_via_conversation_id(self):
+        # F3 end to end on the transform side: the real finalizer hands conversation_id to the
+        # plugin hook, so the status block is appended even after the session id rotated.
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="A", conversation_id="C")
+        agent = SimpleNamespace(session_id="B", model="m", platform="local",
+                                 _inherited_conversation_id="C")
+        final, transformed, _ = apply_llm_output_transform(agent, "MODEL REPORT R", turn_id="t9")
+        self.assertTrue(transformed)
+        self.assertIn("MODEL REPORT R", final)
+        self.assertIn("Goal status:", final)
+
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         # no goal_go

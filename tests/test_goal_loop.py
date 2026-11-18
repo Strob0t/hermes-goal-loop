@@ -112,6 +112,47 @@ class Goal1BeforeWorkTest(unittest.TestCase):
         self.assertIsNone(hook(session_id="s1", platform="api_server", attempt=0))
 
 
+class F3ConversationKeyTest(unittest.TestCase):
+    """F3: state keys on the compression-stable conversation_id and survives session rotation."""
+
+    def test_tool_keys_on_conversation_id_and_hook_reads_it_after_rotation(self):
+        tools, store, _ = make_tools()
+        # a tool call as the dispatcher sends it, before a compaction (session A)
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="A", conversation_id="C")
+        tools.goal_go({}, session_id="A", conversation_id="C")
+        hook = make_pre_stop(store)
+        # after a compaction the session id is B; the conversation root C is unchanged
+        result = hook(session_id="B", platform="local", attempt=0, conversation_id="C")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "continue")
+        self.assertIn("g1", result["message"])
+
+    def test_hook_without_conversation_id_falls_back_to_session_id(self):
+        # an unpatched fork passes no conversation_id: the hook then reads the session-keyed state
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="A")  # no conversation_id -> keyed on A
+        tools.goal_go({}, session_id="A")
+        hook = make_pre_stop(store)
+        result = hook(session_id="A", platform="local", attempt=0)  # no conversation_id
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "continue")
+        # a different session id with no conversation_id finds nothing
+        self.assertIsNone(hook(session_id="B", platform="local", attempt=0))
+
+    def test_transform_reads_state_via_conversation_id(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="A", conversation_id="C")
+        transform = make_transform_llm_output(store)
+        out = transform(response_text="REPORT", session_id="B", conversation_id="C")
+        self.assertIn("REPORT", out)
+        self.assertIn("Goal status:", out)
+        # without the conversation id the rotated session finds no state
+        self.assertIsNone(transform(response_text="REPORT", session_id="B"))
+
+
 class Goal2ToTheEndTest(unittest.TestCase):
     """Goal 2: work to the end; state survives compaction (keyed by chat, not session id)."""
 

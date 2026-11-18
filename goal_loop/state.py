@@ -1,7 +1,9 @@
 """Durable goal state and append-only ledger for one chat session.
 
-The goal context must survive a context compression: Hermes changes the session id on compaction, so
-state is keyed by chat and kept in a JSON file, not in chat memory. The ledger is append-only and is
+The goal context must survive a context compression: Hermes rotates the session id on compaction
+(agent/conversation_compression.py), so state is keyed by the conversation id (the compression-
+lineage root, stable across rotation) with session id as fallback, and kept in a JSON file, not in
+chat memory. The ledger is append-only and is
 written before the state file, so a terminal event (a confirmed or blocked goal) is never lost if the
 process stops between the two writes (the rule from the OpenCode plugin). Each goal keeps a boolean
 ``done`` that only the judge may set to True; the worker changes progress notes, never the verdict.

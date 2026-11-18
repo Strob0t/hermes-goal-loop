@@ -52,13 +52,13 @@ def _state_dir() -> str:
     return os.environ.get(_STATE_DIR_ENV) or _DEFAULT_STATE_DIR
 
 
-def _chat_key(session_id: str) -> str:
-    """Key state by chat. Uses ``session_id`` only and never ``platform``: the dispatcher passes
-    ``session_id``/``conversation_id`` to tool handlers but not ``platform`` (#68318), while the
-    pre_stop hook sees ``agent.platform``. A platform-free key is the one both sides can agree on,
-    so a tool and the hook read the same file. (``conversation_id`` would also survive compaction;
-    moving both sides to it is tracked separately.)"""
-    return f"chat:{session_id or 'default'}"
+def _chat_key(chat_id: str) -> str:
+    """Key state by chat. ``chat_id`` is ``conversation_id`` when the caller has it, else
+    ``session_id``. ``conversation_id`` is the compression-lineage root
+    (agent/prompt_cache_scope.py): a compaction rotates ``session_id`` but keeps
+    ``conversation_id``, so state keyed on it survives compaction (F3). ``platform`` is never part
+    of the key: the dispatcher gives tools no platform, the hooks get ``agent.platform`` (F2)."""
+    return f"chat:{chat_id or 'default'}"
 
 
 # --- Tool schemas -----------------------------------------------------------------------------
@@ -160,7 +160,10 @@ class _Tools:
 
     @staticmethod
     def _ids(kwargs: dict) -> str:
-        return _chat_key(str(kwargs.get("session_id") or ""))
+        # F3: the dispatcher passes both ids; conversation_id is the compression-stable root
+        # (agent/prompt_cache_scope.py), so state keyed on it survives a compaction, which rotates
+        # session_id. Fall back to session_id for callers and tests that only have that.
+        return _chat_key(str(kwargs.get("conversation_id") or kwargs.get("session_id") or ""))
 
     def goal_set(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self.store.load(self._ids(kwargs))
@@ -273,9 +276,10 @@ def make_pre_stop(store: GoalStore):
     given, bounded by the number of goals times a small factor; otherwise it lets the turn finish."""
 
     def _pre_stop(session_id: str = "", platform: str = "", attempt: int = 0,
-                  final_response: str = "", **_: Any) -> Optional[dict]:
+                  final_response: str = "", conversation_id: str = "",
+                  **_: Any) -> Optional[dict]:
         try:
-            state = store.load(_chat_key(session_id))
+            state = store.load(_chat_key(conversation_id or session_id))
         except Exception:
             logger.debug("pre_stop state load failed", exc_info=True)
             return None
@@ -305,14 +309,14 @@ def make_transform_llm_output(store: GoalStore):
     """Append the goal status block to each final answer (goal 4)."""
 
     def _transform(response_text: str = "", text: str = "", session_id: str = "",
-                   platform: str = "", **_: Any) -> Optional[str]:
+                   platform: str = "", conversation_id: str = "", **_: Any) -> Optional[str]:
         # The fork passes the model's answer as ``response_text`` (agent/turn_finalizer.py
         # apply_llm_output_transform); ``text`` is a fallback only, never the live field (F6). A
         # wrong field name here would make the status block OVERWRITE the model's real answer, since
         # the fork takes the first non-empty string the hook returns.
         body = response_text if isinstance(response_text, str) and response_text else text
         try:
-            state = store.load(_chat_key(session_id))
+            state = store.load(_chat_key(conversation_id or session_id))
         except Exception:
             return None
         if not state.goals:
