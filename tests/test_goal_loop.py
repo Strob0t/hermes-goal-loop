@@ -466,11 +466,14 @@ class F8StateDirTest(unittest.TestCase):
                 self.assertEqual(_state_dir(), "/tmp/f8-override")
 
     def test_fallback_without_hermes_home_ends_in_dot_hermes_goal_loop(self):
-        environ = os.environ.copy()
-        environ.pop("GOAL_LOOP_STATE_DIR", None)
-        environ.pop("HERMES_HOME", None)
+        # F9: pin HOME too, so the expanded ~/.hermes/goal-loop never touches the real user home.
+        fake_user = tempfile.mkdtemp(prefix="f8-u-")
+        environ = {k: v for k, v in os.environ.items()
+                   if k not in ("GOAL_LOOP_STATE_DIR", "HERMES_HOME")}
+        environ["HOME"] = fake_user
         with patch.dict(os.environ, environ, clear=True):
-            self.assertTrue(_state_dir().endswith(os.path.join(".hermes", "goal-loop")))
+            self.assertEqual(_state_dir(),
+                             os.path.join(fake_user, ".hermes", "goal-loop"))
 
 
 class RegisterTest(unittest.TestCase):

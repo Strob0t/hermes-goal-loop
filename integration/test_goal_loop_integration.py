@@ -21,6 +21,9 @@ Run (cwd = the patched copy root so its modules win over any installed Hermes):
 import os
 import tempfile
 import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import patch
 
 # Real Hermes modules (the patched copy, because cwd is its root):
 from types import SimpleNamespace
@@ -237,33 +240,36 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
     def test_register_puts_state_under_the_active_hermes_home(self):
         # F8: without GOAL_LOOP_STATE_DIR the plugin's store must live under the Hermes home that
         # loaded the plugin, so an isolated home can never read or overwrite another home's state.
-        saved_dir = os.environ.pop("GOAL_LOOP_STATE_DIR", None)
+        # F9: isolate HOME too (Path.home() + ~/.hermes) and use a unique session id, so a stale
+        # file from an earlier run of this test cannot pass or fail it. patch.dict restores env.
         saved_manager = plugins_facade._plugin_manager
         fake_home = tempfile.mkdtemp(prefix="f8-it-home-")
+        fake_user = tempfile.mkdtemp(prefix="f8-it-user-")
+        real_user_dir = os.path.expanduser("~")  # captured BEFORE patching HOME
+        sid = f"s-f8-{uuid.uuid4().hex[:8]}"
+        chat_file = f"chat_{sid}.json"
+        env = {k: v for k, v in os.environ.items() if k != "GOAL_LOOP_STATE_DIR"}
+        env.update(HERMES_HOME=fake_home, HOME=fake_user)
         try:
-            os.environ["HERMES_HOME"] = fake_home
-            from hermes_constants import get_hermes_home
-            self.assertEqual(str(get_hermes_home()), fake_home)  # the home the plugin will see
-            manager = PluginManager()
-            plugins_facade._plugin_manager = manager
-            ctx = load_real_plugin(manager)   # register() fixes the store now
-            # call the registered goal_set handler through the real registry, as a tool call runs
-            out = ctx.dispatch_tool("goal_set", {"goals": [{"id": "g1", "text": "x",
-                                                            "check": "c"}]}, session_id="s-f8")
-            self.assertIn("g1", out)
-            chat_file = "chat_s-f8.json"
-            self.assertTrue(os.path.isfile(os.path.join(fake_home, "goal-loop", chat_file)),
-                            "state must be under $HERMES_HOME/goal-loop")
-            from pathlib import Path
-            user_dot = Path.home() / ".hermes" / "goal-loop" / chat_file
-            self.assertFalse(user_dot.exists(), "no state under ~/.hermes/goal-loop")
+            with patch.dict(os.environ, env, clear=True):
+                from hermes_constants import get_hermes_home
+                self.assertEqual(str(get_hermes_home()), fake_home)
+                manager = PluginManager()
+                plugins_facade._plugin_manager = manager
+                ctx = load_real_plugin(manager)  # register() fixes the store NOW
+                out = ctx.dispatch_tool("goal_set", {"goals": [{"id": "g1", "text": "x",
+                                                                "check": "c"}]}, session_id=sid)
+                self.assertIn("g1", out)
+                self.assertTrue(os.path.isfile(os.path.join(fake_home, "goal-loop", chat_file)),
+                                "state must be under $HERMES_HOME/goal-loop")
+                # with HOME patched, ~/.hermes expands into fake_user
+                self.assertFalse((Path(fake_user) / ".hermes" / "goal-loop" / chat_file).exists())
+            # after the env is restored: this session id must not appear in the real ~/.hermes.
+            # real_user_dir may not exist (fresh user); treat the missing dir as "absent", not fail.
+            real_leak = Path(real_user_dir) / ".hermes" / "goal-loop" / chat_file
+            self.assertFalse(real_leak.exists(), f"test leaked a file into {real_leak}")
         finally:
-            if saved_dir is not None:
-                os.environ["GOAL_LOOP_STATE_DIR"] = saved_dir
-            else:
-                os.environ.pop("GOAL_LOOP_STATE_DIR", None)
             plugins_facade._plugin_manager = saved_manager
-            os.environ.pop("HERMES_HOME", None)
 
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
