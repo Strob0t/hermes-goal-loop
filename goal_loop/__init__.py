@@ -35,6 +35,14 @@ _DEFAULT_STATE_DIR = os.path.expanduser("~/.hermes/goal-loop")
 
 STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
 
+# Appended to goal_claim's reply when the claim confirms the LAST open goal, so the model does not
+# stop with an empty turn once the loop has nothing left to continue (F5). The model owns the final
+# report; the plugin only prompts for it.
+FINAL_REPORT_NUDGE = (
+    " All goals are now confirmed. Write the final report for the owner in this message: "
+    "list each goal, the judge result, and the evidence (including the file content)."
+)
+
 
 def _state_dir() -> str:
     return os.environ.get(_STATE_DIR_ENV) or _DEFAULT_STATE_DIR
@@ -240,7 +248,12 @@ class _Tools:
             self.store.append_ledger(state.chat_key, "confirmed", goal_id=goal.id,
                                      method=verdict.method)
             self.store.save(state)
-            return f"Goal {goal.id} confirmed by the judge ({verdict.method}). It stays done."
+            reply = f"Goal {goal.id} confirmed by the judge ({verdict.method}). It stays done."
+            # F5: if this was the last open goal, the loop will not continue the turn, so ask the
+            # model for the owner report now instead of letting it stop with an empty message.
+            if not state.open_goals():
+                reply += FINAL_REPORT_NUDGE
+            return reply
         goal.judge_reason = verdict.reason
         goal.status = "in_work"
         self.store.append_ledger(state.chat_key, "rejected", goal_id=goal.id,
@@ -297,6 +310,10 @@ def make_transform_llm_output(store: GoalStore):
         block = status_block(state)
         if not block or not isinstance(text, str):
             return None
+        # F5: keep an empty model turn visible instead of hiding it behind the status block, so a
+        # missing owner report is not silently masked.
+        if not text.strip():
+            return "(no final report from the model)\n" + block
         return text + "\n" + block
 
     return _transform

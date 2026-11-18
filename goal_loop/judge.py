@@ -19,17 +19,21 @@ from typing import Any, Optional
 
 logger = logging.getLogger("goal_loop.judge")
 
-# Read-only toolsets a judge child may use. ``file`` bundles read and write tools, so the judge
-# prompt forbids mutation explicitly; the subset check in subagent_lifecycle keeps it within parent
-# rights. If none of these are in the parent toolsets, the launch path is skipped for ctx.llm.
-JUDGE_TOOLSETS = ("file",)
+# Toolsets a judge child may use. ``terminal`` lets the judge RUN the goal's check command (the
+# checks are shell commands), ``file`` lets it read files; the judge prompt forbids any mutation.
+# subagent_lifecycle.launch clamps this to the parent's rights (it raises if a requested toolset
+# would broaden them), so a parent without ``terminal`` makes run_judge fall back to the tool-less
+# ctx.llm path. The plugin does not filter here: the lifecycle is the authority on parent rights.
+JUDGE_TOOLSETS = ("file", "terminal")
 
 JUDGE_SYSTEM = (
     "You are a goal-completion judge with a fresh context. Verify the claim against the goal and "
-    "its check by inspecting the ACTUAL state of the system. You only read: never edit a file, "
-    "never mutate goal state, never trust the worker's report as proof. Run the goal's check "
-    "command yourself when you can. Answer with exactly one line: 'VERDICT: done' if the goal's "
-    "check is proven to pass now, otherwise 'VERDICT: not-done <one actionable reason>'."
+    "its check by inspecting the ACTUAL state of the system. RUN the goal's check command yourself "
+    "with the terminal tool and read files to confirm. You only inspect: never write or edit a "
+    "file, never mutate goal state, never trust the worker's report as proof. Use only read-only "
+    "commands: no output redirection, no rm, mv, cp, tee, no 'sed -i', no package install, no git "
+    "commit or any command that changes state. Answer with exactly one line: 'VERDICT: done' if "
+    "the goal's check is proven to pass now, otherwise 'VERDICT: not-done <one actionable reason>'."
 )
 
 VERDICT_PREFIX = "VERDICT:"
@@ -71,9 +75,18 @@ def _judge_prompt(goal_text: str, check: str, evidence: str) -> str:
 
 def run_judge(ctx: Any, goal_text: str, check: str, evidence: str,
               *, parent_toolsets: Optional[set] = None) -> Verdict:
-    """Run the judge, preferring a read-only child agent and falling back to a tool-less LLM call."""
+    """Run the judge, preferring a read-only child agent and falling back to a tool-less LLM call.
+
+    ``allowed`` requests ``JUDGE_TOOLSETS``; ``subagent_lifecycle.launch`` clamps the request to the
+    parent's rights and raises if it would broaden them, in which case we fall back to ``ctx.llm``.
+    ``parent_toolsets`` is honoured only when the caller actually knows them (tests); the live
+    dispatcher does not pass them, so by default we rely on the lifecycle's own parent check.
+    """
     prompt = _judge_prompt(goal_text, check, evidence)
-    allowed = tuple(ts for ts in JUDGE_TOOLSETS if not parent_toolsets or ts in parent_toolsets)
+    if parent_toolsets:
+        allowed = tuple(ts for ts in JUDGE_TOOLSETS if ts in parent_toolsets)
+    else:
+        allowed = JUDGE_TOOLSETS
     if allowed:
         try:
             return _judge_via_subagent(ctx, goal_text, prompt, allowed)

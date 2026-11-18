@@ -9,8 +9,10 @@ import tempfile
 import unittest
 
 from goal_loop import (
-    STOP_CAUSES, _Tools, _chat_key, make_pre_stop, make_transform_llm_output, register,
+    FINAL_REPORT_NUDGE, STOP_CAUSES, _Tools, _chat_key, make_pre_stop,
+    make_transform_llm_output, register,
 )
+from goal_loop.judge import JUDGE_TOOLSETS, run_judge
 from goal_loop.claim import ClaimError, serialize_completion_claim
 from goal_loop.state import Goal, GoalState, GoalStore, status_block
 
@@ -42,6 +44,34 @@ class FakeCtx:
 
     def register_hook(self, hook_name, callback, **kw):
         self.hooks.setdefault(hook_name, []).append(callback)
+
+
+
+class _FakeHandle:
+    pass
+
+
+class FakeSubagentLifecycle:
+    """Records each launch spec so a test can assert the requested toolsets."""
+
+    def __init__(self, verdict="VERDICT: done"):
+        self.launches = []
+        self._verdict = verdict
+
+    def launch(self, spec):
+        self.launches.append(spec)
+        return _FakeHandle()
+
+    def wait(self, handle, timeout_seconds=300):
+        class _T:
+            completed = True
+        return _T()
+
+    def result(self, handle):
+        verdict = self._verdict
+        class _R:
+            summary = verdict
+        return _R()
 
 
 def make_tools(verdict_text="VERDICT: done"):
@@ -136,6 +166,59 @@ class Goal2ToTheEndTest(unittest.TestCase):
         reloaded = store.load(_chat_key("s1"))
         self.assertTrue(reloaded.go)
         self.assertEqual(reloaded.goals[0].id, "g1")
+
+
+class F5FinalReportTest(unittest.TestCase):
+    """F5: confirming the last open goal asks the model for the owner report."""
+
+    def test_last_goal_claim_requests_the_final_report(self):
+        tools, _, _ = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": "done",
+            "checks": [{"command": "c", "result": "passed", "exitCode": 0}]}}, **IDS)
+        self.assertIn("confirmed by the judge", out)
+        self.assertIn(FINAL_REPORT_NUDGE.strip(), out)
+
+    def test_earlier_goal_claim_does_not_request_the_report(self):
+        tools, _, _ = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"},
+                                  {"id": "g2", "text": "y", "check": "d"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": "done",
+            "checks": [{"command": "c", "result": "passed", "exitCode": 0}]}}, **IDS)
+        self.assertIn("confirmed by the judge", out)
+        self.assertNotIn(FINAL_REPORT_NUDGE.strip(), out)  # g2 still open
+
+    def test_transform_marks_an_empty_final_turn(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        transform = make_transform_llm_output(store)
+        out = transform(text="   ", session_id="s1", platform="api_server")
+        self.assertIn("no final report from the model", out)
+
+
+class F4JudgeToolsetTest(unittest.TestCase):
+    """F4: the judge child requests terminal so it can run the shell check itself."""
+
+    def test_judge_requests_terminal_toolset(self):
+        life = FakeSubagentLifecycle("VERDICT: done")
+        ctx = FakeCtx()
+        ctx.subagent_lifecycle = life
+        verdict = run_judge(ctx, "file has one line", "test $(wc -l < f) -le 1", "{}")
+        self.assertTrue(verdict.done)
+        self.assertEqual(verdict.method, "subagent")
+        self.assertEqual(len(life.launches), 1)
+        allowed = tuple(life.launches[0]["allowed_toolsets"])
+        self.assertIn("terminal", allowed)
+        self.assertIn("file", allowed)
+
+    def test_known_parent_toolsets_without_terminal_drop_it(self):
+        life = FakeSubagentLifecycle("VERDICT: done")
+        ctx = FakeCtx()
+        ctx.subagent_lifecycle = life
+        # When the caller DOES know the parent rights (tests), terminal is dropped if absent.
+        run_judge(ctx, "g", "c", "{}", parent_toolsets={"file"})
+        allowed = tuple(life.launches[0]["allowed_toolsets"])
+        self.assertEqual(allowed, ("file",))
 
 
 class Goal3JudgeTest(unittest.TestCase):
