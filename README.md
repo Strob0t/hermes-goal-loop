@@ -1,3 +1,4 @@
+http 200 exit 0
 # hermes-goal-loop
 
 A goal loop for [Hermes Agent](https://hermes-agent.nousresearch.com) delivered as a
@@ -48,7 +49,22 @@ patch the plugin's tools still work and the hook is simply never called.
 - `agent.max_stop_continuations` — bound on consecutive `pre_stop` continuations per turn
   (default 20).
 - `GOAL_LOOP_STATE_DIR` — directory for per-chat state and ledger files
-  (default `~/.hermes/goal-loop`).
+  (default `$HERMES_HOME/goal-loop`).
+
+## Where the state lives
+
+Per-chat state and ledger files live under **`$HERMES_HOME/goal-loop`** of the Hermes
+home that loads the plugin, so every home and profile has its own goal state — a test
+home can never read or overwrite another home's goals. `GOAL_LOOP_STATE_DIR` overrides
+the folder (tests, special setups); the folder is fixed once, when the plugin loads.
+
+Hermes compacts a context **in place by default** (`compression.in_place: true`, see
+`hermes_cli/config_defaults.py`): the session id does not change and the goal state
+follows the chat either way. With the rotating path (`compression.in_place: false`)
+the session id changes at every compaction; the plugin then keys on the
+compression-stable `conversation_id` (with the session id as fallback), so the loop
+continues in the rotated session. Keying on `conversation_id` is harmless with
+`in_place: true`.
 
 ## Tests
 
@@ -63,3 +79,4 @@ applied on `sys.path`; it is skipped by the unit run above.
 
 Plugin code: see repository licence. Parts of the completion-claim validation are ported
 from `william-ricchiuti/OpenCode-goal-plugin` (MIT) — see `THIRD_PARTY.md`.
+

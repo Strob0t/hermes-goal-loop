@@ -7,10 +7,11 @@ hook) is tested in the fork; here the hook callback is called directly.
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from goal_loop import (
-    FINAL_REPORT_NUDGE, NO_REPORT_MARKER, STOP_CAUSES, _Tools, _chat_key, make_pre_stop,
-    make_transform_llm_output, register,
+    FINAL_REPORT_NUDGE, NO_REPORT_MARKER, STOP_CAUSES, _Tools, _chat_key,
+    _state_dir, make_pre_stop, make_transform_llm_output, register,
 )
 from goal_loop.judge import JUDGE_TOOLSETS, run_judge
 from goal_loop.claim import ClaimError, serialize_completion_claim
@@ -443,6 +444,33 @@ class StateUnitTest(unittest.TestCase):
             Goal("g3", "c", "c"),
         ])
         self.assertEqual([g.id for g in state.open_goals()], ["g3"])
+
+
+class F8StateDirTest(unittest.TestCase):
+    """F8: the state folder follows the active Hermes home, not a fixed ~/.hermes path."""
+
+    def test_hermes_home_is_used_when_no_override_is_set(self):
+        # get_hermes_home() is importable here (the Hermes tree is not required for these unit
+        # tests, so the fallback path applies): HERMES_HOME/<goal-loop> is the folder.
+        with patch.dict(os.environ, {"HERMES_HOME": tempfile.mkdtemp(prefix="f8-home-")},
+                        clear=False):
+            with patch.dict(os.environ, {}, clear=False):
+                environ = os.environ.copy(); environ.pop("GOAL_LOOP_STATE_DIR", None)
+                with patch.dict(os.environ, environ, clear=True):
+                    self.assertEqual(_state_dir(),
+                                     os.path.join(os.environ["HERMES_HOME"], "goal-loop"))
+
+    def test_override_wins_over_hermes_home(self):
+        with patch.dict(os.environ, {"GOAL_LOOP_STATE_DIR": "/tmp/f8-override"}, clear=False):
+            with patch.dict(os.environ, {"HERMES_HOME": "/tmp/f8-other-home"}, clear=False):
+                self.assertEqual(_state_dir(), "/tmp/f8-override")
+
+    def test_fallback_without_hermes_home_ends_in_dot_hermes_goal_loop(self):
+        environ = os.environ.copy()
+        environ.pop("GOAL_LOOP_STATE_DIR", None)
+        environ.pop("HERMES_HOME", None)
+        with patch.dict(os.environ, environ, clear=True):
+            self.assertTrue(_state_dir().endswith(os.path.join(".hermes", "goal-loop")))
 
 
 class RegisterTest(unittest.TestCase):

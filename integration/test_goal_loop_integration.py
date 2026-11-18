@@ -234,6 +234,37 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertFalse(transformed)
         self.assertEqual(final, "VERDICT: done")
 
+    def test_register_puts_state_under_the_active_hermes_home(self):
+        # F8: without GOAL_LOOP_STATE_DIR the plugin's store must live under the Hermes home that
+        # loaded the plugin, so an isolated home can never read or overwrite another home's state.
+        saved_dir = os.environ.pop("GOAL_LOOP_STATE_DIR", None)
+        saved_manager = plugins_facade._plugin_manager
+        fake_home = tempfile.mkdtemp(prefix="f8-it-home-")
+        try:
+            os.environ["HERMES_HOME"] = fake_home
+            from hermes_constants import get_hermes_home
+            self.assertEqual(str(get_hermes_home()), fake_home)  # the home the plugin will see
+            manager = PluginManager()
+            plugins_facade._plugin_manager = manager
+            ctx = load_real_plugin(manager)   # register() fixes the store now
+            # call the registered goal_set handler through the real registry, as a tool call runs
+            out = ctx.dispatch_tool("goal_set", {"goals": [{"id": "g1", "text": "x",
+                                                            "check": "c"}]}, session_id="s-f8")
+            self.assertIn("g1", out)
+            chat_file = "chat_s-f8.json"
+            self.assertTrue(os.path.isfile(os.path.join(fake_home, "goal-loop", chat_file)),
+                            "state must be under $HERMES_HOME/goal-loop")
+            from pathlib import Path
+            user_dot = Path.home() / ".hermes" / "goal-loop" / chat_file
+            self.assertFalse(user_dot.exists(), "no state under ~/.hermes/goal-loop")
+        finally:
+            if saved_dir is not None:
+                os.environ["GOAL_LOOP_STATE_DIR"] = saved_dir
+            else:
+                os.environ.pop("GOAL_LOOP_STATE_DIR", None)
+            plugins_facade._plugin_manager = saved_manager
+            os.environ.pop("HERMES_HOME", None)
+
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         # no goal_go

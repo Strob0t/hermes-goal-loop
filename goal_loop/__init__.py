@@ -29,9 +29,10 @@ from .state import Goal, GoalState, GoalStore, status_block
 
 logger = logging.getLogger("goal_loop")
 
-# Where per-chat state and ledgers live. Overridable so a test can use a temp dir.
+# Where per-chat state and ledgers live: $HERMES_HOME/goal-loop, so each Hermes home or profile has
+# its own goal state (F8). GOAL_LOOP_STATE_DIR overrides it (tests, special setups).
 _STATE_DIR_ENV = "GOAL_LOOP_STATE_DIR"
-_DEFAULT_STATE_DIR = os.path.expanduser("~/.hermes/goal-loop")
+_STATE_SUBDIR = "goal-loop"
 
 STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
 
@@ -56,7 +57,22 @@ NO_REPORT_MARKER = "(no final report from the model)"
 
 
 def _state_dir() -> str:
-    return os.environ.get(_STATE_DIR_ENV) or _DEFAULT_STATE_DIR
+    """The goal-state folder, resolved at call time (not at import) from the active Hermes home.
+
+    Order: GOAL_LOOP_STATE_DIR, then ``hermes_constants.get_hermes_home()`` (context-local override,
+    then HERMES_HOME, then the platform default), then a plain HERMES_HOME / ~/.hermes fallback when
+    the Hermes module is not importable (plain unit tests). A fixed ~/.hermes path would make every
+    home and profile share one goal state, so a test home could read or overwrite a real one (F8).
+    """
+    override = os.environ.get(_STATE_DIR_ENV)
+    if override:
+        return override
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home() / _STATE_SUBDIR)
+    except Exception:
+        base = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        return os.path.join(base, _STATE_SUBDIR)
 
 
 def _chat_key(chat_id: str) -> str:
@@ -351,6 +367,9 @@ def make_transform_llm_output(store: GoalStore):
 
 def register(ctx) -> None:
     """Register the goal tools and the two hooks (called once by the plugin loader)."""
+    # The state folder is fixed ONCE here, when the plugin loads: $HERMES_HOME/goal-loop of the home
+    # that loads the plugin (or GOAL_LOOP_STATE_DIR). A later change of HERMES_HOME in the same
+    # process does not move an already registered store (F8).
     store = GoalStore(_state_dir())
     tools = _Tools(store, ctx)
     specs = (
