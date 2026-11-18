@@ -67,6 +67,17 @@ def load_real_plugin(manager):
     return ctx
 
 
+def run_stop_gate_with_response(agent, final_response):
+    """Like run_stop_gate but with a chosen final answer (used for a judge VERDICT line)."""
+    final_msg = {"role": "assistant", "content": final_response}
+    messages = [{"role": "user", "content": "judge"}]
+    return apply_stop_gates(
+        agent, final_msg, final_response=final_response, messages=messages,
+        conversation_history=None, pending_verification_response=None,
+        pending_verification_response_previewed=False,
+    ), messages
+
+
 def run_stop_gate(agent):
     """Call the real patched stop gate as the turn finalizer does, with a text answer."""
     final_msg = {"role": "assistant", "content": "interim answer"}
@@ -195,6 +206,33 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertTrue(transformed)
         self.assertIn("MODEL REPORT R", final)
         self.assertIn("Goal status:", final)
+
+    def test_judge_subagent_is_not_driven_by_the_parent_loop(self):
+        # F7 through the REAL gate: the parent sets goals under conversation conv-P; a judge child
+        # runs with platform=subagent and the inherited conv-P. The gate must NOT continue the child.
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="parent", conversation_id="conv-P")
+        self.tools.goal_go({}, session_id="parent", conversation_id="conv-P")
+        # the parent turn continues
+        parent = FakeAgent(session_id="parent", platform="local")
+        parent._inherited_conversation_id = "conv-P"
+        v_parent, _ = run_stop_gate(parent)
+        self.assertTrue(v_parent.continue_turn)
+        # the judge child does NOT: its verdict survives as the final response
+        judge = FakeAgent(session_id="child", platform="subagent")
+        judge._inherited_conversation_id = "conv-P"
+        v_judge, _ = run_stop_gate_with_response(judge, "VERDICT: done")
+        self.assertFalse(v_judge.continue_turn)
+        self.assertEqual(v_judge.final_response, "VERDICT: done")
+
+    def test_transform_leaves_a_subagent_verdict_untouched(self):
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="parent", conversation_id="conv-P")
+        judge = SimpleNamespace(session_id="child", model="m", platform="subagent",
+                                 _inherited_conversation_id="conv-P")
+        final, transformed, _ = apply_llm_output_transform(judge, "VERDICT: done", turn_id="tj")
+        self.assertFalse(transformed)
+        self.assertEqual(final, "VERDICT: done")
 
     def test_no_go_lets_the_turn_finish_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)

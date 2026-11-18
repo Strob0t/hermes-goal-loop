@@ -273,6 +273,42 @@ class F4JudgeToolsetTest(unittest.TestCase):
         self.assertEqual(allowed, ("file",))
 
 
+class F7SubagentExclusionTest(unittest.TestCase):
+    """F7: a judge child inherits the parent's conversation_id, so the loop must not drive it."""
+
+    def test_pre_stop_skips_a_subagent_and_leaves_continuations(self):
+        # goals set in the PARENT conversation conv-P, with go
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="parent", conversation_id="conv-P")
+        tools.goal_go({}, session_id="parent", conversation_id="conv-P")
+        before = store.load(_chat_key("conv-P")).continuations
+        hook = make_pre_stop(store)
+        # the judge child runs with platform=subagent and the INHERITED parent conversation id
+        self.assertIsNone(hook(session_id="child", platform="subagent",
+                               conversation_id="conv-P", attempt=0))
+        # the child must not have written continuations on the parent's state
+        self.assertEqual(store.load(_chat_key("conv-P")).continuations, before)
+        # the same open goals in a real local turn still continue
+        result = hook(session_id="parent", platform="local",
+                      conversation_id="conv-P", attempt=0)
+        self.assertEqual(result["action"], "continue")
+        self.assertIn("g1", result["message"])
+
+    def test_transform_skips_a_subagent_answer(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="parent", conversation_id="conv-P")
+        transform = make_transform_llm_output(store)
+        # the judge's own answer is a VERDICT line; it must pass through untouched (None = no change)
+        self.assertIsNone(transform(response_text="VERDICT: done", platform="subagent",
+                                    conversation_id="conv-P"))
+        # a local answer in the same conversation still gets the status block
+        out = transform(response_text="REPORT", platform="local", conversation_id="conv-P")
+        self.assertIn("REPORT", out)
+        self.assertIn("Goal status:", out)
+
+
 class Goal3JudgeTest(unittest.TestCase):
     """Goal 3: a fresh-context judge checks the real state and gives a reason on rejection."""
 

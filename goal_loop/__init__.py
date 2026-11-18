@@ -35,6 +35,13 @@ _DEFAULT_STATE_DIR = os.path.expanduser("~/.hermes/goal-loop")
 
 STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
 
+# Platforms the loop must never drive. ``cron`` is the owner rule (no loop in scheduled runs).
+# ``subagent`` matters because a delegated child (the judge) INHERITS the parent's conversation_id
+# (tools/delegate_tool.py: child._inherited_conversation_id = conversation_id(parent_agent)), so it
+# would otherwise share the parent's chat:<conversation_id> state key and the pre_stop hook would
+# fire inside the judge, swallowing its verdict (F7). The loop belongs only to the parent session.
+EXCLUDED_PLATFORMS = ("cron", "subagent")
+
 # Appended to goal_claim's reply when the claim confirms the LAST open goal, so the model does not
 # stop with an empty turn once the loop has nothing left to continue (F5). The model owns the final
 # report; the plugin only prompts for it.
@@ -278,13 +285,17 @@ def make_pre_stop(store: GoalStore):
     def _pre_stop(session_id: str = "", platform: str = "", attempt: int = 0,
                   final_response: str = "", conversation_id: str = "",
                   **_: Any) -> Optional[dict]:
+        # Exclude excluded platforms BEFORE touching the store: a judge child inherits the parent's
+        # conversation_id (tools/delegate_tool.py), so without this guard it would read the parent's
+        # state and even write continuations from inside the subagent (F7). The loop is the parent's.
+        if platform in EXCLUDED_PLATFORMS:
+            return None
         try:
             state = store.load(_chat_key(conversation_id or session_id))
         except Exception:
             logger.debug("pre_stop state load failed", exc_info=True)
             return None
-        # Cron sessions are excluded (owner rule); the loop is only for chat-started sessions.
-        if platform == "cron" or not state.go or not state.goals:
+        if not state.go or not state.goals:
             return None
         open_goals = state.open_goals()
         if not open_goals:
@@ -310,6 +321,11 @@ def make_transform_llm_output(store: GoalStore):
 
     def _transform(response_text: str = "", text: str = "", session_id: str = "",
                    platform: str = "", conversation_id: str = "", **_: Any) -> Optional[str]:
+        # A judge child inherits the parent's conversation_id (tools/delegate_tool.py), so without
+        # this guard the parent's status block would be appended to the judge's "VERDICT:" line and
+        # the verdict parse would fail (F7). The status block belongs only to the parent session.
+        if platform in EXCLUDED_PLATFORMS:
+            return None
         # The fork passes the model's answer as ``response_text`` (agent/turn_finalizer.py
         # apply_llm_output_transform); ``text`` is a fallback only, never the live field (F6). A
         # wrong field name here would make the status block OVERWRITE the model's real answer, since
