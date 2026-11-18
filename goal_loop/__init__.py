@@ -67,17 +67,46 @@ _GOAL_SET_SCHEMA = {
     "required": ["goals"],
 }
 
+_CLAIM_CHECK_ITEM_SCHEMA = {
+    "type": "object",
+    "description": "one verification command you actually ran for this goal",
+    "properties": {
+        "command": {"type": "string",
+                    "description": "the shell command you ran, e.g. grep -qx READY ready.txt"},
+        "result": {"type": "string", "enum": ["passed", "failed", "not-run"],
+                   "description": "passed only if the command succeeded; a failed check rejects the claim"},
+        "exitCode": {"type": "integer",
+                     "description": "the command's exit code; 0 for a passed check, omit for not-run"},
+        "explanation": {"type": "string",
+                        "description": "use instead of command for a manual check you cannot script"},
+    },
+    "required": ["result"],
+}
+
+_CLAIM_CRITERION_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "criterion": {"type": "string", "description": "one acceptance criterion in a short phrase"},
+        "evidence": {"type": "array", "items": {"type": "string"},
+                     "description": "at least one concrete evidence string for this criterion"},
+    },
+    "required": ["criterion", "evidence"],
+}
+
 _GOAL_CLAIM_SCHEMA = {
     "type": "object",
     "properties": {
-        "goal_id": {"type": "string"},
+        "goal_id": {"type": "string", "description": "the id from goal_set, e.g. g1"},
         "claim": {
             "type": "object",
-            "description": "structured completion claim with summary, criteria, checks",
+            "description": ("structured completion claim. Minimal valid form: "
+                            '{"summary": "...", "checks": [{"command": "...", "result": "passed", '
+                            '"exitCode": 0}]}'),
             "properties": {
-                "summary": {"type": "string"},
-                "criteria": {"type": "array", "items": {"type": "object"}},
-                "checks": {"type": "array", "items": {"type": "object"}},
+                "summary": {"type": "string",
+                            "description": "one line on what you did to finish this goal"},
+                "criteria": {"type": "array", "items": _CLAIM_CRITERION_ITEM_SCHEMA},
+                "checks": {"type": "array", "items": _CLAIM_CHECK_ITEM_SCHEMA},
                 "changedFiles": {"type": "array", "items": {"type": "string"}},
                 "knownLimitations": {"type": "array", "items": {"type": "string"}},
             },
@@ -188,7 +217,9 @@ class _Tools:
         state = self.store.load(self._ids(kwargs))
         goal = state.goal(str(args.get("goal_id") or ""))
         if goal is None:
-            return "error: unknown goal_id"
+            known = ", ".join(g.id for g in state.goals) or "none set"
+            return (f"error: unknown goal_id {str(args.get('goal_id') or '')!r}. "
+                    f"Known goal ids: {known}. Pass goal_id at the top level, not inside claim.")
         try:
             evidence = serialize_completion_claim(args.get("claim"))
         except ClaimError as exc:
@@ -279,7 +310,10 @@ def register(ctx) -> None:
         ("goal_status", _EMPTY_SCHEMA, tools.goal_status, "📋",
          "Show the goal list with each goal's check and status."),
         ("goal_claim", _GOAL_CLAIM_SCHEMA, tools.goal_claim, "✅",
-         "Submit a structured completion claim for one goal; a fresh-context judge verifies the real state."),
+         ("Submit a structured completion claim for one goal; a fresh-context judge verifies the "
+          'real state. goal_id is top-level; claim needs a summary and checks you ran, e.g. '
+          'claim={"summary": "wrote the file", "checks": [{"command": "grep -qx READY f", '
+          '"result": "passed", "exitCode": 0}]}.')),
         ("goal_decision", _GOAL_DECISION_SCHEMA, tools.goal_decision, "🧭",
          "Record an owner decision (options + recommendation) for the end-of-run decision list."),
         ("goal_block", _GOAL_ID_SCHEMA, tools.goal_block, "⛔",

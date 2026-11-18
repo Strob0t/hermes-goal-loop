@@ -159,6 +159,15 @@ class Goal3JudgeTest(unittest.TestCase):
         self.assertIn("claim rejected", out)
         self.assertEqual(ctx.llm.calls, [])  # judge never ran
 
+    def test_unknown_goal_id_names_known_ids_and_placement(self):
+        tools, _, ctx = make_tools("VERDICT: done")
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        out = tools.goal_claim({"goal_id": "gX", "claim": {"summary": "s"}}, **IDS)
+        self.assertIn("unknown goal_id", out)
+        self.assertIn("g1", out)            # names the known id
+        self.assertIn("top level", out)     # tells the model where goal_id goes
+        self.assertEqual(ctx.llm.calls, [])  # judge never ran
+
     def test_judge_no_verdict_line_fails_closed(self):
         tools, store, _ = make_tools("the work looks fine to me")
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
