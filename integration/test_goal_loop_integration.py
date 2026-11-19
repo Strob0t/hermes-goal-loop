@@ -379,10 +379,10 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
         tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **IDS)
         final, transformed, _ = turn("PROGRESS")                    # progress only: no goal block
-        # v0.3 (L15): the turn ends while g2 is open, so only the paused-loop line is added
+        # v0.3 (L15): the turn ends while g2 is open, so only the follow-up-run line is added
         self.assertTrue(transformed)
         self.assertTrue(final.startswith("PROGRESS"))
-        self.assertIn("goal(s) are open (g2)", final)
+        self.assertIn("goal(s) open (g2)", final)
         self.assertNotIn("- [ ] g1: a", final)
         out = tools.goal_claim({"goal_id": "g2", "claim": {"summary": "s", **CHECKS}}, **IDS)
         self.assertIn("All goals are now confirmed", out)
