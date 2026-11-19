@@ -4,10 +4,12 @@ The plugin delivers the owner's five goals:
 
 1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check, and
    asks for the go. No loop runs before ``goal_go``. **Go rule:** ``goal_go`` is accepted only when
-   an owner message came into the chat after the last ``goal_set`` of the session; otherwise the tool
-   returns an error text and the loop does not start. The ``pre_llm_call`` hook counts the owner
-   messages (it fires once per incoming turn, never for a ``pre_stop`` continuation; gateway
-   notifications, subagent and cron turns do not count).
+   an owner message came into the chat after the last ``goal_set``; otherwise the tool returns an
+   error text and the loop does not start. The ``pre_llm_call`` hook counts the owner messages (it
+   fires once per incoming turn, never for a ``pre_stop`` continuation; gateway notifications,
+   gateway wake self-posts, subagent and cron turns do not count). The gate is keyed on the
+   compression-stable ``conversation_id`` (session id as fallback), so a compaction between
+   ``goal_set`` and the go does not lose it.
 2. To the end: a generic ``pre_stop`` hook (added by the companion fork patch) keeps the turn going
    while open goals remain, with no file edit, bounded by ``agent.max_stop_continuations``.
 3. The judge: ``goal_claim`` submits a structured claim; a fresh-context judge checks the real state
@@ -20,7 +22,8 @@ The plugin delivers the owner's five goals:
      (``goal_block``) and a new owner decision (``goal_decision``), each one time. Progress and
      judge rejections add nothing.
    - When the judge has confirmed all goals, the full list with checkmarks is appended one time,
-     to the answer with the final report. Then the chat appends nothing until a new ``goal_set``.
+     to the answer with the final report. Then the chat appends nothing until a new ``goal_set``,
+     except a new owner decision (``goal_decision``), one time.
 
    ``goal_status`` returns the full list as finished text, and its description tells the model to
    give that text to the owner unchanged. There is no ``/goals`` slash command: on the Open WebUI →
@@ -133,9 +136,17 @@ def _chat_key(chat_id: str) -> str:
     return f"chat:{chat_id or 'default'}"
 
 
-def _gate_key(session_id: Any) -> str:
-    """The go gate is keyed by the session id: ``pre_llm_call`` gets only ``session_id``."""
-    return str(session_id or "default")
+def _gate_keys(conversation_id: Any, session_id: Any) -> list[str]:
+    """The go gate keys of one chat, primary first: the compression-stable ``conversation_id``
+    (it survives a compaction that rotates ``session_id``), then the ``session_id``. A Hermes
+    without the fork patch hands ``pre_llm_call`` only the session id, so ``goal_set`` opens the
+    gate under both keys and ``goal_go`` reads both."""
+    keys: list[str] = []
+    for value in (conversation_id, session_id):
+        key = str(value or "")
+        if key and key not in keys:
+            keys.append(key)
+    return keys or ["default"]
 
 
 # --- Tool schemas -----------------------------------------------------------------------------
@@ -268,7 +279,9 @@ class _Tools:
         state.list_changed = True
         state.final_shown = False
         # Go rule: no owner message has come after this goal_set yet.
-        self.store.open_gate(_gate_key(kwargs.get("session_id")))
+        keys = _gate_keys(kwargs.get("conversation_id"), kwargs.get("session_id"))
+        for key in keys:
+            self.store.open_gate(key, linked=[k for k in keys if k != key])
         self.store.append_ledger(state.chat_key, "goals_set", count=len(goals))
         self.store.save(state)
         lines = ["Goals recorded. Show this list to the owner and ask for the go:"]
@@ -283,15 +296,16 @@ class _Tools:
             return "error: no goals set; call goal_set first"
         if state.go:
             return f"Go already recorded. The loop works the {len(state.open_goals())} open goal(s)."
-        gate = _gate_key(kwargs.get("session_id"))
-        count = self.store.gate_count(gate)
+        keys = _gate_keys(kwargs.get("conversation_id"), kwargs.get("session_id"))
+        count = max((self.store.gate_count(key) or 0 for key in keys), default=0)
         if not count:
             self.store.append_ledger(state.chat_key, "go_refused", owner_messages=count)
             return GO_REFUSED
         state.go = True
         self.store.append_ledger(state.chat_key, "go", owner_messages=count)
         self.store.save(state)
-        self.store.close_gate(gate)
+        for key in keys:
+            self.store.close_gate(key)
         return f"Go recorded. The loop will work the {len(state.open_goals())} open goal(s) to the end."
 
     def goal_status(self, args: dict[str, Any], **kwargs: Any) -> str:
@@ -404,7 +418,8 @@ def _display_block(state: GoalState) -> str:
     """Decide what this turn's answer shows and record it as shown (the caller saves the state).
 
     1. ``goal_set`` set or changed the list in this turn: the full list.
-    2. All goals judge-confirmed and the final list not shown yet: the full list, one time.
+    2. All goals judge-confirmed and the final list not shown yet: the full list, one time. After
+       that, only a new owner decision, one time.
     3. Otherwise only the owner items not shown yet: newly blocked goals and new decisions.
     """
     if state.list_changed:
@@ -412,11 +427,18 @@ def _display_block(state: GoalState) -> str:
         state.final_shown = state.all_done()
         return status_block(state)
     if state.all_done():
-        if state.final_shown:
+        if not state.final_shown:
+            state.final_shown = True
+            state.mark_all_shown()
+            return status_block(state)
+        # After the final list: a new owner decision still reaches the owner, one time.
+        start = min(max(state.decisions_shown, 0), len(state.decisions))
+        decisions = [(index, text) for index, text in enumerate(state.decisions, start=1)
+                     if index > start]
+        if not decisions:
             return ""
-        state.final_shown = True
-        state.mark_all_shown()
-        return status_block(state)
+        state.decisions_shown = len(state.decisions)
+        return owner_block([], decisions)
     blocked = [g for g in state.goals if g.status == "blocked" and not g.done and not g.block_shown]
     start = min(max(state.decisions_shown, 0), len(state.decisions))
     decisions = [(index, text) for index, text in enumerate(state.decisions, start=1)
@@ -484,7 +506,9 @@ def _is_owner_message(user_message: Any, conversation_history: Any) -> bool:
     has no synthesized ``display_kind``. Two typed rows count as human: a ``/steer`` row, and an
     API client turn. With the session authority, every ``/v1/runs`` turn is stored as
     ``internal_notification`` with ``display_metadata.api_inbound`` True
-    (gateway/session_ingress.py, gateway/response_filters.py persisted_user_metadata_for_event)."""
+    (gateway/session_ingress.py, gateway/response_filters.py persisted_user_metadata_for_event).
+    A gateway wake self-post (gateway/wake.py, e.g. a kanban wake without the footer) re-uses the
+    API door; the fork patch marks it ``hermes_wake``, so its row has no ``api_inbound`` flag."""
     text = _message_text(user_message).strip()
     if not text or _INTERNAL_FOOTER_PREFIX in text[-400:]:
         return False
@@ -507,12 +531,15 @@ def make_pre_llm_call(store: GoalStore):
     Returns None: the hook injects no context."""
 
     def _pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = None,
-                      conversation_history: Any = None, **_: Any) -> None:
+                      conversation_history: Any = None, conversation_id: str = "",
+                      **_: Any) -> None:
         if platform in EXCLUDED_PLATFORMS:
             return None
         try:
             if _is_owner_message(user_message, conversation_history):
-                store.bump_gate(_gate_key(session_id))
+                # The fork patch hands the compression-stable conversation_id; without it the
+                # session id is the key (goal_set opened the gate under both).
+                store.bump_gate(_gate_keys(conversation_id, session_id)[0])
         except Exception:
             logger.debug("goal-loop go gate update failed", exc_info=True)
         return None

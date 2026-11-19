@@ -214,6 +214,44 @@ class GoRuleTest(unittest.TestCase):
         owner_says(store, "s1", [{"type": "text", "text": "go"}, {"type": "image_url"}])
         self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
 
+    def test_a_rotation_between_goal_set_and_the_go_keeps_the_gate(self):
+        # compression.in_place false: goal_set in s1, the go message and goal_go in the rotated s2;
+        # the fork patch hands pre_llm_call the conversation_id, the tools get it from the dispatcher
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="s1", conversation_id="conv")
+        make_pre_llm_call(store)(session_id="s2", conversation_id="conv", platform="api_server",
+                                 user_message="go", conversation_history=[{"role": "user", "content": "go"}])
+        out = tools.goal_go({}, session_id="s2", conversation_id="conv")
+        self.assertTrue(out.startswith("Go recorded"), out)
+        self.assertTrue(store.load(_chat_key("conv")).go)
+        self.assertEqual([f for f in os.listdir(store.base_dir) if f.startswith("gate_")], [])
+
+    def test_a_rotation_still_refuses_a_go_without_an_owner_message(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="s1", conversation_id="conv")
+        self.assertEqual(tools.goal_go({}, session_id="s2", conversation_id="conv"), GO_REFUSED)
+
+    def test_without_the_fork_patch_the_session_id_gate_still_works(self):
+        # an unpatched Hermes gives pre_llm_call no conversation_id; the tools still have it
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                       session_id="s1", conversation_id="conv")
+        owner_says(store, "s1", "go")
+        self.assertTrue(tools.goal_go({}, session_id="s1", conversation_id="conv")
+                        .startswith("Go recorded"))
+
+    def test_a_wake_self_post_row_without_api_inbound_does_not_count(self):
+        # gateway/wake.py self-post under the session authority after the fork patch: the row is
+        # internal_notification without api_inbound (kanban wakes have no footer)
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "s1", "[kanban] Task t1 completed.", history=[{
+            "role": "user", "content": "[kanban] Task t1 completed.",
+            "display_kind": "internal_notification", "display_metadata": {"gateway_input_owner": "o"}}])
+        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+
 
 class DisplayOnSetAndChangeTest(unittest.TestCase):
     """g1: the status block appears exactly in a turn where goal_set set or changed the list."""
@@ -324,6 +362,13 @@ class FinalListOnceTest(unittest.TestCase):
         self.assertIn("- [x] g2: b", out)
         self.assertTrue(store.load(_chat_key("s1")).final_shown)
         self.assertIsNone(transform(response_text="later", **IDS))
+        # a decision after the final list still reaches the owner, one time
+        tools.goal_decision({"text": "late pick: A or B"}, **IDS)
+        out = transform(response_text="AFTER", **IDS)
+        self.assertIn("needs the owner", out)
+        self.assertIn("1. late pick: A or B", out)
+        self.assertNotIn("g1: a", out)
+        self.assertIsNone(transform(response_text="again", **IDS))
         tools.goal_set({"goals": [{"id": "n1", "text": "new", "check": "c"}]}, **IDS)
         out = transform(response_text="NEW", **IDS)
         self.assertIn("- [ ] n1: new", out)

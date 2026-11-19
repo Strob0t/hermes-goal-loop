@@ -15,9 +15,10 @@ all-confirmed list was shown once), ``decisions_shown`` (how many decisions the 
 fields existed loads without error; its missing fields default to "already shown", so an upgrade
 never floods a running chat with old items.
 
-The go gate is a separate small file per **session id**: ``goal_set`` opens it with a count of 0,
-the ``pre_llm_call`` hook adds 1 for each owner message of that session, and ``goal_go`` is
-accepted only when the count is at least 1.
+The go gate is a separate small file per **chat**: ``goal_set`` opens it with a count of 0 under
+the compression-stable ``conversation_id`` and under the ``session_id`` (a Hermes without the fork
+patch gives ``pre_llm_call`` only the session id), the ``pre_llm_call`` hook adds 1 for each owner
+message, and ``goal_go`` is accepted only when one of the two counts is at least 1.
 """
 from __future__ import annotations
 
@@ -114,7 +115,7 @@ class GoalStore:
 
     ``base_dir`` holds ``<chat>.json`` (state) and ``<chat>.ledger`` (one JSON event per line).
     A terminal event is appended to the ledger BEFORE the state file is rewritten.
-    ``gate_<session>.json`` holds the go gate of one session id.
+    ``gate_<key>.json`` holds the go gate of one chat (key: conversation id or session id).
     """
 
     def __init__(self, base_dir: str) -> None:
@@ -131,8 +132,8 @@ class GoalStore:
     def _ledger_path(self, chat_key: str) -> str:
         return os.path.join(self.base_dir, f"{self._safe(chat_key)}.ledger")
 
-    def _gate_path(self, session_id: str) -> str:
-        return os.path.join(self.base_dir, f"gate_{self._safe(session_id)}.json")
+    def _gate_path(self, key: str) -> str:
+        return os.path.join(self.base_dir, f"gate_{self._safe(key)}.json")
 
     def load(self, chat_key: str) -> GoalState:
         path = self._state_path(chat_key)
@@ -165,37 +166,48 @@ class GoalStore:
         with open(path, encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
-    # --- go gate (per session id) ---------------------------------------------------------------
+    # --- go gate (per chat: conversation id and session id) --------------------------------------
 
-    def open_gate(self, session_id: str) -> None:
-        """``goal_set`` ran in this session: no owner message has come after it yet."""
-        self._write_atomic(self._gate_path(session_id),
-                           json.dumps({"session_id": session_id, "owner_messages": 0}))
+    def open_gate(self, key: str, linked: Optional[list[str]] = None) -> None:
+        """``goal_set`` ran in this chat: no owner message has come after it yet. ``linked`` are
+        the other keys of the same gate; :meth:`close_gate` removes them together."""
+        self._write_atomic(self._gate_path(key), json.dumps(
+            {"session_id": key, "owner_messages": 0, "linked": list(linked or [])}))
 
-    def gate_count(self, session_id: str) -> Optional[int]:
-        """Owner messages since the last ``goal_set`` of this session, or None without a gate."""
-        path = self._gate_path(session_id)
+    def _gate_data(self, key: str) -> Optional[dict]:
+        path = self._gate_path(key)
         if not os.path.exists(path):
             return None
         try:
             with open(path, encoding="utf-8") as handle:
-                return int(json.load(handle).get("owner_messages", 0))
-        except (OSError, ValueError, AttributeError):
+                data = json.load(handle)
+            int(data.get("owner_messages", 0))
+            return data
+        except (OSError, ValueError, AttributeError, TypeError):
             return None
 
-    def bump_gate(self, session_id: str) -> bool:
+    def gate_count(self, key: str) -> Optional[int]:
+        """Owner messages since the last ``goal_set`` under this key, or None without a gate."""
+        data = self._gate_data(key)
+        return None if data is None else int(data.get("owner_messages", 0))
+
+    def bump_gate(self, key: str) -> bool:
         """Count one owner message for an open gate. No gate: nothing is written."""
-        count = self.gate_count(session_id)
-        if count is None:
+        data = self._gate_data(key)
+        if data is None:
             return False
-        self._write_atomic(self._gate_path(session_id),
-                           json.dumps({"session_id": session_id, "owner_messages": count + 1}))
+        data["owner_messages"] = int(data.get("owner_messages", 0)) + 1
+        self._write_atomic(self._gate_path(key), json.dumps(data))
         return True
 
-    def close_gate(self, session_id: str) -> None:
-        path = self._gate_path(session_id)
-        if os.path.exists(path):
-            os.remove(path)
+    def close_gate(self, key: str) -> None:
+        """Remove the gate under this key and its linked keys (an old gate file has none)."""
+        data = self._gate_data(key) or {}
+        linked = data.get("linked") if isinstance(data.get("linked"), list) else []
+        for name in [key, *[str(k) for k in linked]]:
+            path = self._gate_path(name)
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def _goal_line(goal: Goal) -> str:

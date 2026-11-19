@@ -97,16 +97,20 @@ def run_stop_gate(agent):
     ), messages
 
 
-def owner_message(session_id, text="Go", platform="api_server", api_row=True):
+def owner_message(session_id, text="Go", platform="api_server", api_row=True, conversation_root=None):
     """One incoming owner turn through the REAL pre_llm_call dispatch of the fork
     (agent/turn_context.py _collect_pre_llm_call_context), as run_conversation fires it. With
     ``api_row`` the user row has the shape a /v1/runs turn has under the session authority
     (display_kind internal_notification + display_metadata.api_inbound, see
-    gateway/response_filters.py display_kind_for_event and persisted_user_metadata_for_event)."""
+    gateway/response_filters.py display_kind_for_event and persisted_user_metadata_for_event).
+    ``conversation_root`` simulates a session after a compaction rotation (the agent's
+    conversation_id differs from its session_id)."""
     from agent.turn_context import _collect_pre_llm_call_context
     from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
     agent = SimpleNamespace(session_id=session_id, model="m", platform=platform,
                             _persist_disabled=False)
+    if conversation_root:
+        agent._inherited_conversation_id = conversation_root
     row = {"role": "user", "content": text}
     if api_row:
         row.update(display_kind=INTERNAL_NOTIFICATION_DISPLAY_KIND,
@@ -391,6 +395,19 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         owner_message("it-sess", "Go", api_row=False)
         self.assertTrue(self.tools.goal_go({}, **IDS).startswith("Go recorded"))
+
+    def test_go_rule_survives_a_rotation_through_the_real_dispatch(self):
+        # compression.in_place false: goal_set in the old session, the go turn in the rotated one.
+        # Needs the fork commit that hands conversation_id to pre_llm_call.
+        import inspect
+        from agent import turn_context
+        if "conversation_id=" not in inspect.getsource(turn_context._collect_pre_llm_call_context):
+            self.skipTest("fork without conversation_id in pre_llm_call")
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
+                            session_id="old-sess", conversation_id="conv-root")
+        owner_message("new-sess", "Go", conversation_root="conv-root")
+        out = self.tools.goal_go({}, session_id="new-sess", conversation_id="conv-root")
+        self.assertTrue(out.startswith("Go recorded"), out)
 
     def test_usage_hint_in_a_normal_session_prompt_and_not_in_a_judge_session(self):
         # g6: the real system-prompt section path renders the hint for a normal session only.

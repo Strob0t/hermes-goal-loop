@@ -39,7 +39,7 @@ there is news for the owner:
 | after the go: a goal became blocked (`goal_block`) or a new owner decision (`goal_decision`) | only these items (`Goal status (needs the owner):`), each one time |
 | progress, a goal in work, a judge rejection, a confirmed goal while others are open | nothing |
 | the judge confirmed the last goal | the full list with checkmarks, one time, with the final report |
-| after the final list, until a new `goal_set` | nothing |
+| after the final list, until a new `goal_set` | only a new owner decision (`goal_decision`), one time; otherwise nothing |
 
 The state file records what the chat has shown (`list_changed`, `final_shown`,
 `decisions_shown`, `block_shown` for each goal). A state file of an older plugin version
@@ -80,11 +80,18 @@ for each incoming turn (`agent/turn_context.py`, `_collect_pre_llm_call_context`
 never for a `pre_stop` continuation inside a turn. An API client turn counts also when
 the session authority stores its user row as `internal_notification` with
 `display_metadata.api_inbound` (`gateway/session_ingress.py`). These turns do not count: a
-gateway notification (the text ends with the `[INTERNAL NOTIFICATION ...]` footer), a turn
-whose user row has another synthesized `display_kind` (a typed `/steer` row counts), an
-empty turn, and the `cron` and `subagent` platforms. The count is kept in
-`gate_<session id>.json` in the state folder, because `pre_llm_call` gets the session id
-only.
+gateway notification (the text ends with the `[INTERNAL NOTIFICATION ...]` footer), a
+gateway wake self-post such as a kanban wake (`gateway/wake.py`; the fork patch marks it
+`hermes_wake`, so its row gets no `api_inbound` flag), a turn whose user row has another
+synthesized `display_kind` (a typed `/steer` row counts), an empty turn, and the `cron`
+and `subagent` platforms.
+
+The count is kept in `gate_<key>.json` in the state folder. The key is the
+compression-stable `conversation_id`, which the fork patch hands to `pre_llm_call`; so a
+compaction that rotates the session id between `goal_set` and the go keeps the gate.
+`goal_set` opens the gate also under the session id, and `goal_go` reads both: on a Hermes
+without the patch the hook gives only the session id, and the gate then follows the
+session id (a rotation in that case needs a new `goal_set`).
 
 ## Usage hint
 
@@ -111,6 +118,10 @@ started before the plugin update gets the hint only after a new session.
 - The companion fork patch that adds the generic `pre_stop` stop-gate hook
   (`patch_stop_hook.py` on the `goal-loop-patches` branch of the Hermes fork). The plugin
   degrades to tools-only without it.
+- For the go rule across a compaction and for kanban wakes: the fork commit that hands
+  `conversation_id` to `pre_llm_call` and marks wake self-posts `hermes_wake`
+  (`local-tests/test_wake_gate.py` on `goal-loop-patches`). Without it the go rule still
+  works, keyed on the session id.
 
 ## Config
 
@@ -132,8 +143,7 @@ follows the chat either way. With the rotating path (`compression.in_place: fals
 the session id changes at every compaction; the plugin then keys on the
 compression-stable `conversation_id` (with the session id as fallback), so the loop
 continues in the rotated session. Keying on `conversation_id` is harmless with
-`in_place: true`. The go gate is keyed on the session id: a rotation between `goal_set`
-and the go needs one more owner message.
+`in_place: true`. The go gate uses the same `conversation_id` key (see **Go rule**).
 
 ## Tests
 
