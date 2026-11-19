@@ -1,21 +1,25 @@
 """Integration test (Deliverable 3): the goal-loop plugin and the patched fork operate together.
 
-This test runs against a REAL Hermes source tree with the stop-hook patch applied (the temp copy
-``hermes-copy1``), not a mock of it. It:
+This test runs against a REAL Hermes source tree with the stop-hook patch applied (the fork branch
+``goal-loop-patches``), not a mock of it. It:
 
 1. Registers the REAL plugin through a REAL ``PluginManager``/``PluginContext`` (the same
-   ``register(ctx)`` path the loader uses), so the plugin's ``pre_stop`` and ``transform_llm_output``
-   hooks land in the manager's hook registry.
+   ``register(ctx)`` path the loader uses), so the plugin's ``pre_stop``, ``transform_llm_output``
+   and ``pre_llm_call`` hooks and its system-prompt section land in the manager's registries.
 2. Drives the REAL patched ``agent.turn_stop_gates.apply_stop_gates`` with a minimal fake agent.
    The patch's ``_pre_stop_nudge`` gate calls ``has_hook("pre_stop")`` and
    ``get_pre_stop_continue_message(...)``, which dispatch to the registered plugin callback. A
    continue verdict proves the two pieces work together end to end.
-3. Proves the no-op property: with NO plugin registered, the patched gate changes nothing (the
+3. Drives the REAL ``agent.turn_finalizer.apply_llm_output_transform`` turn by turn (one
+   ``turn_id`` per turn) for the quiet status display, the REAL
+   ``agent.turn_context._collect_pre_llm_call_context`` for the owner-message count of the go rule,
+   and the REAL ``agent.system_prompt._frozen_plugin_prompt_sections`` for the usage hint.
+4. Proves the no-op property: with NO plugin registered, the patched gate changes nothing (the
    turn finishes), so the fork patch alone does not change Hermes behaviour.
 
-Run (cwd = the patched copy root so its modules win over any installed Hermes):
-    cd <hermes-copy1>
-    PYTHONPATH=<plugin-dir> GOAL_LOOP_STATE_DIR=<tmp> \\
+Run (cwd = the patched fork root so its modules win over any installed Hermes):
+    cd <fork goal-loop-patches root>
+    PYTHONPATH=<plugin-repo-root> GOAL_LOOP_STATE_DIR=<tmp> \\
         <venv>/bin/python -m unittest integration.test_goal_loop_integration -v
 """
 import os
@@ -38,6 +42,7 @@ from hermes_cli.plugins_manifest import PluginManifest
 import goal_loop  # the real plugin under test
 
 IDS = {"session_id": "it-sess", "platform": "api_server"}
+CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
 
 
 class FakeAgent:
@@ -61,8 +66,8 @@ class FakeAgent:
 
 def load_real_plugin(manager):
     """Run the plugin's real register(ctx) against a real PluginContext on *manager*."""
-    manifest = PluginManifest(name="goal-loop", version="0.1.0", source="user",
-                              provides_hooks=["pre_stop", "transform_llm_output"])
+    manifest = PluginManifest(name="goal-loop", version="0.2.0", source="user",
+                              provides_hooks=["pre_stop", "transform_llm_output", "pre_llm_call"])
     ctx = PluginContext(manifest, manager)
     goal_loop.register(ctx)
     # The manager is now a real consumer of pre_stop; mark discovery done so lazy scans are skipped.
@@ -90,6 +95,26 @@ def run_stop_gate(agent):
         conversation_history=None, pending_verification_response=None,
         pending_verification_response_previewed=False,
     ), messages
+
+
+def owner_message(session_id, text="Go", platform="api_server", api_row=True):
+    """One incoming owner turn through the REAL pre_llm_call dispatch of the fork
+    (agent/turn_context.py _collect_pre_llm_call_context), as run_conversation fires it. With
+    ``api_row`` the user row has the shape a /v1/runs turn has under the session authority
+    (display_kind internal_notification + display_metadata.api_inbound, see
+    gateway/response_filters.py display_kind_for_event and persisted_user_metadata_for_event)."""
+    from agent.turn_context import _collect_pre_llm_call_context
+    from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+    agent = SimpleNamespace(session_id=session_id, model="m", platform=platform,
+                            _persist_disabled=False)
+    row = {"role": "user", "content": text}
+    if api_row:
+        row.update(display_kind=INTERNAL_NOTIFICATION_DISPLAY_KIND,
+                   display_metadata={"api_inbound": True})
+    messages = [row]
+    return _collect_pre_llm_call_context(
+        agent, effective_task_id="task", turn_id=f"turn-{uuid.uuid4().hex[:6]}",
+        original_user_message=text, messages=messages, conversation_history=None)
 
 
 class PatchedGateNoPluginTest(unittest.TestCase):
@@ -126,14 +151,19 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         plugins_facade._plugin_manager = self._saved
         del os.environ["GOAL_LOOP_STATE_DIR"]
 
+    def go(self, **ids):
+        owner_message(ids.get("session_id"))
+        return self.tools.goal_go({}, **ids)
+
     def test_hook_is_registered_in_the_real_manager(self):
         self.assertTrue(self.manager.has_hook("pre_stop"))
         self.assertTrue(self.manager.has_hook("transform_llm_output"))
+        self.assertTrue(self.manager.has_hook("pre_llm_call"))
         self.assertIn("goal_set", goal_loop._Tools.__dict__)
 
     def test_open_goal_with_go_continues_the_turn_through_the_patched_gate(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "branch exists", "check": "git rev-parse g1"}]}, **IDS)
-        self.tools.goal_go({}, **IDS)
+        self.go(**IDS)
         agent = FakeAgent(**IDS)
         verdict, messages = run_stop_gate(agent)
         # The patched gate asked the plugin and got a continue directive:
@@ -162,13 +192,15 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertIn("goal_id", claim.get("required", []))
         set_props = defs["goal_set"]["parameters"].get("properties", {})
         self.assertIn("goals", set_props)
+        # g4 b): the model reads the "give it unchanged" rule in goal_status's description
+        self.assertIn("unchanged", defs["goal_status"]["description"])
 
     def test_tool_without_platform_and_hook_with_platform_share_state(self):
         # F2: the dispatcher passes tools session_id/conversation_id but NOT platform (#68318);
         # the pre_stop hook sees agent.platform. Both must key on the same file or the loop is blind.
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                             session_id="it-sess")          # no platform, as the dispatcher sends it
-        self.tools.goal_go({}, session_id="it-sess")
+        self.go(session_id="it-sess")
         agent = FakeAgent(session_id="it-sess", platform="local")  # hook side: a real platform
         verdict, messages = run_stop_gate(agent)
         self.assertTrue(verdict.continue_turn)              # the hook found the tool's state
@@ -191,7 +223,7 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         # conversation_id to the pre_stop hook; the plugin keys on it).
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                             session_id="A", conversation_id="C")
-        self.tools.goal_go({}, session_id="A", conversation_id="C")
+        self.go(session_id="A", conversation_id="C")
         agent = FakeAgent(session_id="B", platform="local")   # rotated session id
         agent._inherited_conversation_id = "C"                # the stable conversation root
         verdict, messages = run_stop_gate(agent)
@@ -215,7 +247,7 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         # runs with platform=subagent and the inherited conv-P. The gate must NOT continue the child.
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                             session_id="parent", conversation_id="conv-P")
-        self.tools.goal_go({}, session_id="parent", conversation_id="conv-P")
+        self.go(session_id="parent", conversation_id="conv-P")
         # the parent turn continues
         parent = FakeAgent(session_id="parent", platform="local")
         parent._inherited_conversation_id = "conv-P"
@@ -280,7 +312,7 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
 
     def test_all_goals_done_lets_the_turn_finish(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        self.tools.goal_go({}, **IDS)
+        self.go(**IDS)
         state = self.tools.store.load(goal_loop._chat_key("it-sess"))
         state.goals[0].done = True
         self.tools.store.save(state)
@@ -291,11 +323,88 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
     def test_bound_stops_the_loop_at_max_stop_continuations(self):
         from agent.verify_hooks import max_stop_continuations
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        self.tools.goal_go({}, **IDS)
+        self.go(**IDS)
         agent = FakeAgent(**IDS)
         agent._pre_stop_nudges = max_stop_continuations()  # at the ceiling
         verdict, _ = run_stop_gate(agent)
         self.assertFalse(verdict.continue_turn)  # the bound stops the continuation
+
+    # --- quiet display, go rule, usage hint ----------------------------------------------------
+
+    def test_final_list_once_over_three_turns_through_the_real_finalizer(self):
+        # g3: turn with the last confirmation shows the full list with checkmarks, the next turn
+        # shows nothing, a new goal_set shows the new list. One turn_id per turn, as the fork does.
+        # The judge ctx is a stand-in (no model key); the store, the plugin hooks and the
+        # finalizer are real.
+        judge_ctx = SimpleNamespace(subagent_lifecycle=None, llm=SimpleNamespace(
+            complete=lambda **kw: SimpleNamespace(text="VERDICT: done")))
+        tools = goal_loop._Tools(self.tools.store, judge_ctx)
+        agent = SimpleNamespace(session_id="it-sess", model="m", platform="api_server")
+
+        def turn(text):
+            agent._llm_output_transform = None
+            return apply_llm_output_transform(agent, text, turn_id=f"t-{uuid.uuid4().hex[:6]}")
+
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                  {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
+        final, transformed, _ = turn("HERE IS THE LIST")           # turn 0: goal_set
+        self.assertTrue(transformed)
+        self.assertIn("- [ ] g1: a", final)
+        owner_message("it-sess", "Go")
+        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
+        tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **IDS)
+        final, transformed, _ = turn("PROGRESS")                    # progress only: quiet
+        self.assertFalse(transformed)
+        self.assertEqual(final, "PROGRESS")
+        out = tools.goal_claim({"goal_id": "g2", "claim": {"summary": "s", **CHECKS}}, **IDS)
+        self.assertIn("All goals are now confirmed", out)
+        final, transformed, _ = turn("FINAL REPORT")                # turn 1: all confirmed
+        self.assertTrue(transformed)
+        self.assertTrue(final.startswith("FINAL REPORT"))
+        self.assertIn("- [x] g1: a", final)
+        self.assertIn("- [x] g2: b", final)
+        final, transformed, _ = turn("LATER ANSWER")                # turn 2: nothing
+        self.assertFalse(transformed)
+        self.assertEqual(final, "LATER ANSWER")
+        tools.goal_set({"goals": [{"id": "n1", "text": "new goal", "check": "c"}]}, **IDS)
+        final, transformed, _ = turn("NEW LIST")                    # turn 3: new goal_set
+        self.assertTrue(transformed)
+        self.assertIn("- [ ] n1: new goal", final)
+        self.assertNotIn("g1: a", final)
+
+    def test_go_rule_through_the_real_pre_llm_call_dispatch(self):
+        # g5: goal_go directly after goal_set is refused; after an owner turn it is accepted.
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        self.assertEqual(self.tools.goal_go({}, **IDS), goal_loop.GO_REFUSED)
+        verdict, _ = run_stop_gate(FakeAgent(**IDS))
+        self.assertFalse(verdict.continue_turn)                    # the loop did not start
+        # a gateway notification turn does not count
+        from gateway.run_notifications import _mark_internal_notification
+        owner_message("it-sess", _mark_internal_notification("background job done"), api_row=False)
+        self.assertEqual(self.tools.goal_go({}, **IDS), goal_loop.GO_REFUSED)
+        self.assertEqual(owner_message("it-sess", "Go"), "")      # the hook injects no context
+        self.assertTrue(self.tools.goal_go({}, **IDS).startswith("Go recorded"))
+        verdict, _ = run_stop_gate(FakeAgent(**IDS))
+        self.assertTrue(verdict.continue_turn)
+
+    def test_go_rule_counts_a_plain_user_row_without_the_session_authority(self):
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_message("it-sess", "Go", api_row=False)
+        self.assertTrue(self.tools.goal_go({}, **IDS).startswith("Go recorded"))
+
+    def test_usage_hint_in_a_normal_session_prompt_and_not_in_a_judge_session(self):
+        # g6: the real system-prompt section path renders the hint for a normal session only.
+        from agent.system_prompt import _frozen_plugin_prompt_sections, _plugin_section_blocks
+        normal = SimpleNamespace(session_id="n-sess", model="m", provider="p", platform="api_server")
+        judge = SimpleNamespace(session_id="j-sess", model="m", provider="p", platform="subagent")
+        normal_blocks = "\n".join(_plugin_section_blocks(_frozen_plugin_prompt_sections(normal),
+                                                         "after_memory"))
+        judge_blocks = "\n".join(_plugin_section_blocks(_frozen_plugin_prompt_sections(judge),
+                                                        "after_memory"))
+        self.assertIn(goal_loop.USAGE_HINT, normal_blocks)
+        self.assertIn("## Plugin Context: goal-loop", normal_blocks)
+        self.assertNotIn(goal_loop.USAGE_HINT, judge_blocks)
+        self.assertNotIn("goal-loop", judge_blocks)
 
 
 if __name__ == "__main__":

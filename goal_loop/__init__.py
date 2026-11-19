@@ -3,15 +3,34 @@
 The plugin delivers the owner's five goals:
 
 1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check, and
-   asks for the go. ``goal_status`` shows the list. No loop runs before ``goal_go``.
+   asks for the go. No loop runs before ``goal_go``. **Go rule:** ``goal_go`` is accepted only when
+   an owner message came into the chat after the last ``goal_set`` of the session; otherwise the tool
+   returns an error text and the loop does not start. The ``pre_llm_call`` hook counts the owner
+   messages (it fires once per incoming turn, never for a ``pre_stop`` continuation; gateway
+   notifications, subagent and cron turns do not count).
 2. To the end: a generic ``pre_stop`` hook (added by the companion fork patch) keeps the turn going
-   while open goals remain, with no file edit, bounded by the goal count of continuations.
+   while open goals remain, with no file edit, bounded by ``agent.max_stop_continuations``.
 3. The judge: ``goal_claim`` submits a structured claim; a fresh-context judge checks the real state
    read-only and gives a reason for each goal it rejects (see :mod:`goal_loop.judge`).
-4. Status: a judge-confirmed goal stays done for the session; a status block is appended to each
-   answer (``transform_llm_output``) so every report shows all goals.
-5. Decisions: ``goal_decision`` records an owner decision; the status block renders them as a
-   numbered text list, no card and no modal.
+4. Status, shown quietly (``transform_llm_output``):
+
+   - The full goal list is appended to the answer of a turn in which ``goal_set`` set or changed
+     the list, also after the go.
+   - After that, an answer shows only what needs the owner: a goal that became blocked
+     (``goal_block``) and a new owner decision (``goal_decision``), each one time. Progress and
+     judge rejections add nothing.
+   - When the judge has confirmed all goals, the full list with checkmarks is appended one time,
+     to the answer with the final report. Then the chat appends nothing until a new ``goal_set``.
+
+   ``goal_status`` returns the full list as finished text, and its description tells the model to
+   give that text to the owner unchanged. There is no ``/goals`` slash command: on the Open WebUI →
+   pipe → ``POST /v1/runs`` path a slash text never reaches a plugin command handler (see README).
+5. Decisions: ``goal_decision`` records an owner decision; it is shown as a numbered text list, no
+   card and no modal.
+
+Usage hint: the plugin adds a short system-prompt section (``register_system_prompt_section``):
+for a multi-step task call ``goal_set`` first, then show the list and wait for the owner's go. The
+section is empty (so not rendered) in judge sessions and the other ``EXCLUDED_PLATFORMS``.
 
 The plugin never starts a turn in an API session and never edits core files (plugin rule). The
 continuation is owned by the generic ``pre_stop`` fork patch; without that patch the hook simply
@@ -21,11 +40,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .claim import ClaimError, serialize_completion_claim
 from .judge import run_judge
-from .state import Goal, GoalState, GoalStore, status_block
+from .state import Goal, GoalState, GoalStore, owner_block, status_block
 
 logger = logging.getLogger("goal_loop")
 
@@ -55,6 +74,36 @@ FINAL_REPORT_NUDGE = (
 # owner report stays visible instead of being masked by the status block (F5/F6).
 NO_REPORT_MARKER = "(no final report from the model)"
 
+# The usage hint for the model (system-prompt section, not for EXCLUDED_PLATFORMS).
+PROMPT_SECTION_ID = "goal-loop"
+USAGE_HINT = (
+    "Goal loop: for a multi-step task, first call goal_set with the goals, each with one "
+    "falsifiable check. Then show the goal list to the owner and wait for the owner's go. Call "
+    "goal_go only after the owner gave the go in a new message; goal_go refuses a go without an "
+    "owner message after the last goal_set."
+)
+
+GO_REFUSED = (
+    "error: goal_go refused: no owner message came after the last goal_set. Show the goal list "
+    "to the owner, ask for the go and end your turn. Call goal_go only in the turn that answers "
+    "the owner's go. The loop does not start."
+)
+
+GOAL_STATUS_DESCRIPTION = (
+    "Return the goal list with each goal's check and status as finished text. Give the returned "
+    "text to the owner unchanged, word for word: do not summarize, shorten, reorder or reformat it."
+)
+
+# Gateway wake/notification turns end with this footer (gateway/run_notifications.py
+# INTERNAL_NOTIFICATION_FOOTER); such a turn is machinery, not an owner message.
+_INTERNAL_FOOTER_PREFIX = "[INTERNAL NOTIFICATION"
+# A typed /steer row has full user authority (agent/prompt_builder.py STEER_DISPLAY_KIND); every
+# other display_kind on the turn's user row marks a synthesized turn.
+_STEER_DISPLAY_KIND = "steer"
+# gateway/response_filters.py INTERNAL_NOTIFICATION_DISPLAY_KIND: also the kind of an API client turn
+# under the session authority; the api_inbound metadata flag tells the two apart.
+_API_TURN_DISPLAY_KIND = "internal_notification"
+
 
 def _state_dir() -> str:
     """The goal-state folder, resolved at call time (not at import) from the active Hermes home.
@@ -82,6 +131,11 @@ def _chat_key(chat_id: str) -> str:
     ``conversation_id``, so state keyed on it survives compaction (F3). ``platform`` is never part
     of the key: the dispatcher gives tools no platform, the hooks get ``agent.platform`` (F2)."""
     return f"chat:{chat_id or 'default'}"
+
+
+def _gate_key(session_id: Any) -> str:
+    """The go gate is keyed by the session id: ``pre_llm_call`` gets only ``session_id``."""
+    return str(session_id or "default")
 
 
 # --- Tool schemas -----------------------------------------------------------------------------
@@ -210,27 +264,38 @@ class _Tools:
         state.goals = goals
         state.go = False
         state.continuations = 0
+        # Display: this turn shows the full list (g1); a new list can be finished (and shown) again.
+        state.list_changed = True
+        state.final_shown = False
+        # Go rule: no owner message has come after this goal_set yet.
+        self.store.open_gate(_gate_key(kwargs.get("session_id")))
         self.store.append_ledger(state.chat_key, "goals_set", count=len(goals))
         self.store.save(state)
         lines = ["Goals recorded. Show this list to the owner and ask for the go:"]
         for goal in goals:
             lines.append(f"- {goal.id}: {goal.text} (check: {goal.check})")
-        lines.append("No loop runs before goal_go.")
+        lines.append("No loop runs before goal_go. Call goal_go only after the owner's go message.")
         return "\n".join(lines)
 
     def goal_go(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self.store.load(self._ids(kwargs))
         if not state.goals:
             return "error: no goals set; call goal_set first"
+        if state.go:
+            return f"Go already recorded. The loop works the {len(state.open_goals())} open goal(s)."
+        gate = _gate_key(kwargs.get("session_id"))
+        count = self.store.gate_count(gate)
+        if not count:
+            self.store.append_ledger(state.chat_key, "go_refused", owner_messages=count)
+            return GO_REFUSED
         state.go = True
-        self.store.append_ledger(state.chat_key, "go")
+        self.store.append_ledger(state.chat_key, "go", owner_messages=count)
         self.store.save(state)
+        self.store.close_gate(gate)
         return f"Go recorded. The loop will work the {len(state.open_goals())} open goal(s) to the end."
 
     def goal_status(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self.store.load(self._ids(kwargs))
-        if not state.goals:
-            return "No goals set."
         block = status_block(state)
         return block.lstrip("\n-") if block else "No goals set."
 
@@ -251,6 +316,7 @@ class _Tools:
             return "error: unknown goal_id"
         goal.status = "blocked"
         goal.note = str(args.get("reason") or "").strip()
+        goal.block_shown = False
         self.store.append_ledger(state.chat_key, "blocked", goal_id=goal.id, reason=goal.note[:200])
         self.store.save(state)
         return f"Goal {goal.id} marked blocked. The loop will not retry it."
@@ -332,8 +398,39 @@ def make_pre_stop(store: GoalStore):
     return _pre_stop
 
 
+# --- The status display (transform_llm_output) -------------------------------------------------
+
+def _display_block(state: GoalState) -> str:
+    """Decide what this turn's answer shows and record it as shown (the caller saves the state).
+
+    1. ``goal_set`` set or changed the list in this turn: the full list.
+    2. All goals judge-confirmed and the final list not shown yet: the full list, one time.
+    3. Otherwise only the owner items not shown yet: newly blocked goals and new decisions.
+    """
+    if state.list_changed:
+        state.mark_all_shown()
+        state.final_shown = state.all_done()
+        return status_block(state)
+    if state.all_done():
+        if state.final_shown:
+            return ""
+        state.final_shown = True
+        state.mark_all_shown()
+        return status_block(state)
+    blocked = [g for g in state.goals if g.status == "blocked" and not g.done and not g.block_shown]
+    start = min(max(state.decisions_shown, 0), len(state.decisions))
+    decisions = [(index, text) for index, text in enumerate(state.decisions, start=1)
+                 if index > start]
+    if not blocked and not decisions:
+        return ""
+    for goal in blocked:
+        goal.block_shown = True
+    state.decisions_shown = len(state.decisions)
+    return owner_block(blocked, decisions)
+
+
 def make_transform_llm_output(store: GoalStore):
-    """Append the goal status block to each final answer (goal 4)."""
+    """Append the goal display to the final answer of a turn, only when there is news (goal 4)."""
 
     def _transform(response_text: str = "", text: str = "", session_id: str = "",
                    platform: str = "", conversation_id: str = "", **_: Any) -> Optional[str]:
@@ -347,15 +444,21 @@ def make_transform_llm_output(store: GoalStore):
         # wrong field name here would make the status block OVERWRITE the model's real answer, since
         # the fork takes the first non-empty string the hook returns.
         body = response_text if isinstance(response_text, str) and response_text else text
+        if not isinstance(body, str):
+            return None
         try:
             state = store.load(_chat_key(conversation_id or session_id))
         except Exception:
             return None
         if not state.goals:
             return None
-        block = status_block(state)
-        if not block or not isinstance(body, str):
+        block = _display_block(state)
+        if not block:
             return None
+        try:
+            store.save(state)
+        except Exception:
+            logger.debug("goal display state save failed", exc_info=True)
         # F5: keep an empty model turn visible instead of hiding it behind the status block, so a
         # missing owner report is not silently masked.
         if not body.strip():
@@ -365,8 +468,70 @@ def make_transform_llm_output(store: GoalStore):
     return _transform
 
 
+# --- The go gate (pre_llm_call) ----------------------------------------------------------------
+
+def _message_text(message: Any) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        return "\n".join(str(part.get("text") or "") for part in message
+                         if isinstance(part, dict) and part.get("type") in (None, "text", "input_text"))
+    return ""
+
+
+def _is_owner_message(user_message: Any, conversation_history: Any) -> bool:
+    """True for a human turn: not empty, no gateway notification footer, and the turn's user row
+    has no synthesized ``display_kind``. Two typed rows count as human: a ``/steer`` row, and an
+    API client turn. With the session authority, every ``/v1/runs`` turn is stored as
+    ``internal_notification`` with ``display_metadata.api_inbound`` True
+    (gateway/session_ingress.py, gateway/response_filters.py persisted_user_metadata_for_event)."""
+    text = _message_text(user_message).strip()
+    if not text or _INTERNAL_FOOTER_PREFIX in text[-400:]:
+        return False
+    if isinstance(conversation_history, list):
+        row = next((m for m in reversed(conversation_history)
+                    if isinstance(m, dict) and m.get("role") == "user"), None)
+        kind = row.get("display_kind") if isinstance(row, dict) else None
+        if kind and kind != _STEER_DISPLAY_KIND:
+            metadata = row.get("display_metadata")
+            api_inbound = (kind == _API_TURN_DISPLAY_KIND and isinstance(metadata, dict)
+                           and metadata.get("api_inbound") is True)
+            if not api_inbound:
+                return False
+    return True
+
+
+def make_pre_llm_call(store: GoalStore):
+    """Count owner messages for the go gate. ``pre_llm_call`` fires once per incoming turn
+    (agent/turn_context.py _collect_pre_llm_call_context), never for a pre_stop continuation.
+    Returns None: the hook injects no context."""
+
+    def _pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = None,
+                      conversation_history: Any = None, **_: Any) -> None:
+        if platform in EXCLUDED_PLATFORMS:
+            return None
+        try:
+            if _is_owner_message(user_message, conversation_history):
+                store.bump_gate(_gate_key(session_id))
+        except Exception:
+            logger.debug("goal-loop go gate update failed", exc_info=True)
+        return None
+
+    return _pre_llm_call
+
+
+# --- The usage hint (system-prompt section) ----------------------------------------------------
+
+def prompt_section(session_info: Mapping[str, Any]) -> str:
+    """The usage hint for a normal session; empty (so not rendered) for EXCLUDED_PLATFORMS."""
+    platform = str((session_info or {}).get("platform") or "")
+    if platform in EXCLUDED_PLATFORMS:
+        return ""
+    return USAGE_HINT
+
+
 def register(ctx) -> None:
-    """Register the goal tools and the two hooks (called once by the plugin loader)."""
+    """Register the goal tools, the three hooks and the usage hint (called once by the loader)."""
     # The state folder is fixed ONCE here, when the plugin loads: $HERMES_HOME/goal-loop of the home
     # that loads the plugin (or GOAL_LOOP_STATE_DIR). A later change of HERMES_HOME in the same
     # process does not move an already registered store (F8).
@@ -376,9 +541,9 @@ def register(ctx) -> None:
         ("goal_set", _GOAL_SET_SCHEMA, tools.goal_set, "🎯",
          "Record the goals, each with one falsifiable check. Call before any goal work; then ask the owner for the go."),
         ("goal_go", _EMPTY_SCHEMA, tools.goal_go, "🟢",
-         "Record the owner's go. The loop works the open goals to the end after this."),
-        ("goal_status", _EMPTY_SCHEMA, tools.goal_status, "📋",
-         "Show the goal list with each goal's check and status."),
+         ("Record the owner's go. Call it only after the owner gave the go in a new message after "
+          "goal_set; otherwise it is refused. The loop works the open goals to the end after this.")),
+        ("goal_status", _EMPTY_SCHEMA, tools.goal_status, "📋", GOAL_STATUS_DESCRIPTION),
         ("goal_claim", _GOAL_CLAIM_SCHEMA, tools.goal_claim, "✅",
          ("Submit a structured completion claim for one goal; a fresh-context judge verifies the "
           'real state. goal_id is top-level; claim needs a summary and checks you ran, e.g. '
@@ -401,4 +566,14 @@ def register(ctx) -> None:
             handler=handler, emoji=emoji, description=description)
     ctx.register_hook("pre_stop", make_pre_stop(store))
     ctx.register_hook("transform_llm_output", make_transform_llm_output(store))
-    logger.info("goal-loop plugin registered: 6 tools, pre_stop + transform_llm_output hooks")
+    ctx.register_hook("pre_llm_call", make_pre_llm_call(store))
+    # hermes_cli/plugins_context.py register_system_prompt_section: rendered once per new session
+    # (agent/system_prompt.py _frozen_plugin_prompt_sections); an empty string is not rendered.
+    register_section = getattr(ctx, "register_system_prompt_section", None)
+    if callable(register_section):
+        try:
+            register_section(PROMPT_SECTION_ID, prompt_section)
+        except Exception:
+            logger.warning("goal-loop usage hint not registered", exc_info=True)
+    logger.info("goal-loop plugin registered: 6 tools, pre_stop + transform_llm_output + "
+                "pre_llm_call hooks, usage hint")

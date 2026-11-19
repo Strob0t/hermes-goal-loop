@@ -1,6 +1,6 @@
 name: goal-loop
-version: 0.1.0
-description: "Goal loop for Hermes: set goals with checks, work to the end via a generic pre_stop hook, verify each goal with a fresh-context judge, keep done goals done, and list owner decisions as text. Needs the companion fork patch for the pre_stop stop-gate hook."
+version: 0.2.0
+description: "Goal loop for Hermes: set goals with checks, go only after an owner message, work to the end via a generic pre_stop hook, verify each goal with a fresh-context judge, keep done goals done, and show the goal list quietly (on set or change, owner items, the final list once). Needs the companion fork patch for the pre_stop stop-gate hook."
 author: Strob0t
 kind: backend
 requires_hermes: ">=0.23.2"
@@ -14,3 +14,4 @@ provides_tools:
 provides_hooks:
   - pre_stop
   - transform_llm_output
+  - pre_llm_call

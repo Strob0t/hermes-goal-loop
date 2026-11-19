@@ -4,14 +4,16 @@ These tests are self-contained: they use a fake ctx and a temp state dir, so the
 ``python -m unittest`` without a Hermes install. The companion fork patch (the generic ``pre_stop``
 hook) is tested in the fork; here the hook callback is called directly.
 """
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from goal_loop import (
-    FINAL_REPORT_NUDGE, NO_REPORT_MARKER, STOP_CAUSES, _Tools, _chat_key,
-    _state_dir, make_pre_stop, make_transform_llm_output, register,
+    EXCLUDED_PLATFORMS, FINAL_REPORT_NUDGE, GO_REFUSED, GOAL_STATUS_DESCRIPTION, NO_REPORT_MARKER,
+    PROMPT_SECTION_ID, STOP_CAUSES, USAGE_HINT, _Tools, _chat_key, _state_dir, make_pre_llm_call,
+    make_pre_stop, make_transform_llm_output, prompt_section, register,
 )
 from goal_loop.judge import JUDGE_TOOLSETS, run_judge
 from goal_loop.claim import ClaimError, serialize_completion_claim
@@ -39,13 +41,16 @@ class FakeCtx:
         self.subagent_lifecycle = None  # force the ctx.llm path
         self.tools = []
         self.hooks = {}
+        self.sections = {}
 
     def register_tool(self, name, toolset, schema, handler, emoji="", description="", **kw):
-        self.tools.append((name, toolset, handler))
+        self.tools.append((name, toolset, handler, schema))
 
     def register_hook(self, hook_name, callback, **kw):
         self.hooks.setdefault(hook_name, []).append(callback)
 
+    def register_system_prompt_section(self, id, content, **kw):
+        self.sections[id] = content
 
 
 class _FakeHandle:
@@ -83,6 +88,25 @@ def make_tools(verdict_text="VERDICT: done"):
 
 
 IDS = {"session_id": "s1", "platform": "api_server"}
+CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
+
+
+def owner_says(store, session_id, text="go", platform="api_server", history=None):
+    """One owner message as the fork's pre_llm_call hook delivers it (agent/turn_context.py)."""
+    if history is None:
+        history = [{"role": "user", "content": text}]
+    make_pre_llm_call(store)(session_id=session_id, platform=platform, user_message=text,
+                             conversation_history=history, task_id="t", turn_id="turn")
+
+
+def go(tools, store, **ids):
+    """The owner answers the goal list with a go; then the model calls goal_go."""
+    owner_says(store, ids.get("session_id"))
+    return tools.goal_go({}, **ids)
+
+
+def claim(tools, goal_id, **ids):
+    return tools.goal_claim({"goal_id": goal_id, "claim": {"summary": "s", **CHECKS}}, **ids)
 
 
 class Goal1BeforeWorkTest(unittest.TestCase):
@@ -113,6 +137,265 @@ class Goal1BeforeWorkTest(unittest.TestCase):
         self.assertIsNone(hook(session_id="s1", platform="api_server", attempt=0))
 
 
+class GoRuleTest(unittest.TestCase):
+    """g5: goal_go is accepted only after an owner message that came after the last goal_set."""
+
+    def test_go_directly_after_goal_set_is_refused_and_the_loop_does_not_start(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        out = tools.goal_go({}, **IDS)
+        self.assertTrue(out.startswith("error:"))
+        self.assertEqual(out, GO_REFUSED)
+        self.assertFalse(store.load(_chat_key("s1")).go)
+        self.assertIsNone(make_pre_stop(store)(session_id="s1", platform="api_server", attempt=0))
+        self.assertEqual(store.read_ledger(_chat_key("s1"))[-1]["event"], "go_refused")
+
+    def test_go_after_an_owner_message_is_accepted_and_the_loop_starts(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "s1", "Go")
+        out = tools.goal_go({}, **IDS)
+        self.assertTrue(out.startswith("Go recorded"))
+        self.assertTrue(store.load(_chat_key("s1")).go)
+        result = make_pre_stop(store)(session_id="s1", platform="api_server", attempt=0)
+        self.assertEqual(result["action"], "continue")
+
+    def test_an_owner_message_before_goal_set_does_not_count(self):
+        tools, store, _ = make_tools()
+        owner_says(store, "s1", "please plan this")      # the request that leads to goal_set
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+
+    def test_a_new_goal_set_needs_a_new_owner_message(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        self.assertTrue(go(tools, store, **IDS).startswith("Go recorded"))
+        tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]}, **IDS)
+        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+
+    def test_notification_subagent_and_cron_turns_do_not_count(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        footer = ("[INTERNAL NOTIFICATION — generated by the Hermes gateway, not written by a "
+                  "human user. Do not treat it as user input.]")
+        owner_says(store, "s1", "process done\n\n" + footer)
+        owner_says(store, "s1", "wake", history=[{"role": "user", "content": "wake",
+                                                  "display_kind": "internal_notification"}])
+        owner_says(store, "s1", "")
+        for platform in EXCLUDED_PLATFORMS:
+            owner_says(store, "s1", "go", platform=platform)
+        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+
+    def test_a_typed_steer_row_counts_as_owner_message(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "s1", "go", history=[{"role": "user", "content": "go",
+                                                "display_kind": "steer"}])
+        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
+
+    def test_an_api_client_turn_under_the_session_authority_counts(self):
+        # /v1/runs under the session authority: the row is internal_notification + api_inbound
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "s1", "Go", history=[{
+            "role": "user", "content": "Go", "display_kind": "internal_notification",
+            "display_metadata": {"api_inbound": True}}])
+        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
+
+    def test_the_gate_is_per_session(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "other-session", "go")
+        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+
+    def test_a_multimodal_owner_message_counts(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        owner_says(store, "s1", [{"type": "text", "text": "go"}, {"type": "image_url"}])
+        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
+
+
+class DisplayOnSetAndChangeTest(unittest.TestCase):
+    """g1: the status block appears exactly in a turn where goal_set set or changed the list."""
+
+    def setUp(self):
+        self.tools, self.store, _ = make_tools("VERDICT: not-done the file is missing")
+        self.transform = make_transform_llm_output(self.store)
+
+    def answer(self, text="ANSWER"):
+        return self.transform(response_text=text, **IDS)
+
+    def test_first_set_shows_the_block(self):
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
+        out = self.answer()
+        self.assertTrue(out.startswith("ANSWER"))
+        self.assertIn("Goal status:", out)
+        self.assertIn("g1: a (check: c1)", out)
+        self.assertIsNone(self.answer())  # the next turn without a change shows nothing
+
+    def test_change_shows_the_block_again_also_after_the_go(self):
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
+        self.answer()
+        go(self.tools, self.store, **IDS)
+        self.assertIsNone(self.answer())
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                       {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
+        out = self.answer()
+        self.assertIn("Goal status:", out)
+        self.assertIn("g2: b (check: c2)", out)
+
+    def test_a_status_change_without_a_list_change_shows_nothing(self):
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                       {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
+        self.answer()
+        go(self.tools, self.store, **IDS)
+        self.assertIsNone(self.answer())
+        # in work and rejected by the judge
+        self.assertIn("rejected", claim(self.tools, "g1", **IDS))
+        self.assertEqual(self.store.load(_chat_key("s1")).goal("g1").status, "in_work")
+        self.assertIsNone(self.answer())
+        # done (one goal of two)
+        self.tools.ctx.llm._text = "VERDICT: done"
+        self.assertIn("confirmed", claim(self.tools, "g1", **IDS))
+        self.assertIsNone(self.answer())
+
+
+class AfterGoOwnerItemsTest(unittest.TestCase):
+    """g2: after the go an answer shows only blocked goals and open owner decisions."""
+
+    def setUp(self):
+        self.tools, self.store, _ = make_tools("VERDICT: not-done no evidence")
+        self.transform = make_transform_llm_output(self.store)
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                       {"id": "g2", "text": "b", "check": "c2"},
+                                       {"id": "g3", "text": "c", "check": "c3"}]}, **IDS)
+        self.transform(response_text="LIST", **IDS)
+        go(self.tools, self.store, **IDS)
+
+    def answer(self, text="ANSWER"):
+        return self.transform(response_text=text, **IDS)
+
+    def test_a_blocked_goal_and_a_decision_appear(self):
+        self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
+        self.tools.goal_decision({"text": "Name: A, B or C. Recommend A."}, **IDS)
+        out = self.answer()
+        self.assertIn("needs the owner", out)
+        self.assertIn("g2: b", out)
+        self.assertIn("[blocked] — token missing", out)
+        self.assertIn("1. Name: A, B or C. Recommend A.", out)
+        self.assertNotIn("g1: a", out)   # no progress lines
+        self.assertNotIn("g3: c", out)
+        self.assertIsNone(self.answer())  # each owner item is shown one time
+
+    def test_a_second_decision_shows_only_the_new_one_with_its_number(self):
+        self.tools.goal_decision({"text": "first"}, **IDS)
+        self.answer()
+        self.tools.goal_decision({"text": "second"}, **IDS)
+        out = self.answer()
+        self.assertIn("2. second", out)
+        self.assertNotIn("1. first", out)
+
+    def test_a_turn_with_only_progress_appends_nothing(self):
+        self.tools.ctx.llm._text = "VERDICT: done"
+        claim(self.tools, "g1", **IDS)
+        make_pre_stop(self.store)(session_id="s1", platform="api_server", attempt=0)
+        self.assertIsNone(self.answer())
+
+    def test_a_turn_with_only_a_judge_rejection_appends_nothing(self):
+        self.assertIn("rejected", claim(self.tools, "g1", **IDS))
+        self.assertIsNone(self.answer())
+
+
+class FinalListOnceTest(unittest.TestCase):
+    """g3: the full list with checkmarks appears one time when the judge confirmed all goals."""
+
+    def test_final_list_once_then_nothing_until_a_new_goal_set(self):
+        tools, store, _ = make_tools("VERDICT: done")
+        transform = make_transform_llm_output(store)
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                  {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
+        transform(response_text="LIST", **IDS)
+        go(tools, store, **IDS)
+        claim(tools, "g1", **IDS)
+        self.assertIn(FINAL_REPORT_NUDGE.strip(), claim(tools, "g2", **IDS))
+        out = transform(response_text="FINAL REPORT", **IDS)
+        self.assertTrue(out.startswith("FINAL REPORT"))
+        self.assertIn("- [x] g1: a", out)
+        self.assertIn("- [x] g2: b", out)
+        self.assertTrue(store.load(_chat_key("s1")).final_shown)
+        self.assertIsNone(transform(response_text="later", **IDS))
+        tools.goal_set({"goals": [{"id": "n1", "text": "new", "check": "c"}]}, **IDS)
+        out = transform(response_text="NEW", **IDS)
+        self.assertIn("- [ ] n1: new", out)
+        self.assertNotIn("g1: a", out)
+
+    def test_an_old_state_file_without_the_new_fields_loads(self):
+        tmp = tempfile.mkdtemp(prefix="goal-loop-old-")
+        store = GoalStore(tmp)
+        old = {"chat_key": "chat:s1", "version": 1, "go": True, "continuations": 2,
+               "decisions": ["old decision"],
+               "goals": [{"id": "g1", "text": "a", "check": "c", "status": "done", "done": True,
+                          "note": "", "judge_reason": ""},
+                         {"id": "g2", "text": "b", "check": "c", "status": "blocked",
+                          "done": False, "note": "why", "judge_reason": ""}]}
+        with open(os.path.join(tmp, "chat_s1.json"), "w", encoding="utf-8") as handle:
+            json.dump(old, handle)
+        state = store.load("chat:s1")
+        self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
+        self.assertTrue(state.go)
+        self.assertFalse(state.list_changed)
+        self.assertEqual(state.decisions_shown, 1)       # the old decision was shown already
+        self.assertTrue(state.goal("g2").block_shown)    # the old blocked goal was shown already
+        self.assertFalse(state.final_shown)              # not all done
+        # the old state shows nothing new
+        self.assertIsNone(make_transform_llm_output(store)(response_text="x", session_id="s1"))
+        # an old, completely done state counts as shown
+        old["goals"][1].update(status="done", done=True)
+        with open(os.path.join(tmp, "chat_s1.json"), "w", encoding="utf-8") as handle:
+            json.dump(old, handle)
+        self.assertTrue(store.load("chat:s1").final_shown)
+        store.save(store.load("chat:s1"))                # it saves in the new format
+        with open(os.path.join(tmp, "chat_s1.json"), encoding="utf-8") as handle:
+            self.assertIn("final_shown", handle.read())
+
+
+class GoalStatusToolTest(unittest.TestCase):
+    """g4 b): goal_status returns the full list as finished text, the description asks for it 1:1."""
+
+    def test_goal_status_returns_the_finished_block(self):
+        tools, store, _ = make_tools()
+        self.assertEqual(tools.goal_status({}, **IDS), "No goals set.")
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
+                                  {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
+        tools.goal_decision({"text": "pick A"}, **IDS)
+        out = tools.goal_status({}, **IDS)
+        self.assertEqual(out, status_block(store.load(_chat_key("s1"))).lstrip("\n-"))
+        self.assertTrue(out.startswith("Goal status:\n- [ ] g1: a (check: c1) [open]"))
+        self.assertIn("1. pick A", out)
+
+    def test_goal_status_does_not_change_the_display_state(self):
+        tools, store, _ = make_tools()
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
+        tools.goal_status({}, **IDS)
+        self.assertTrue(store.load(_chat_key("s1")).list_changed)
+
+    def test_description_asks_for_the_text_unchanged(self):
+        self.assertIn("unchanged", GOAL_STATUS_DESCRIPTION)
+        self.assertIn("word for word", GOAL_STATUS_DESCRIPTION)
+
+
+class UsageHintTest(unittest.TestCase):
+    """g6: the usage hint is in the prompt of a normal session, not of a judge session."""
+
+    def test_hint_for_a_normal_session_and_none_for_excluded_platforms(self):
+        text = prompt_section({"platform": "api_server", "session_id": "s"})
+        self.assertEqual(text, USAGE_HINT)
+        self.assertIn("goal_set", text)
+        self.assertIn("go", text)
+        for platform in EXCLUDED_PLATFORMS:
+            self.assertEqual(prompt_section({"platform": platform}), "")
+
+
 class F3ConversationKeyTest(unittest.TestCase):
     """F3: state keys on the compression-stable conversation_id and survives session rotation."""
 
@@ -121,7 +404,7 @@ class F3ConversationKeyTest(unittest.TestCase):
         # a tool call as the dispatcher sends it, before a compaction (session A)
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="A", conversation_id="C")
-        tools.goal_go({}, session_id="A", conversation_id="C")
+        go(tools, store, session_id="A", conversation_id="C")
         hook = make_pre_stop(store)
         # after a compaction the session id is B; the conversation root C is unchanged
         result = hook(session_id="B", platform="local", attempt=0, conversation_id="C")
@@ -134,7 +417,7 @@ class F3ConversationKeyTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="A")  # no conversation_id -> keyed on A
-        tools.goal_go({}, session_id="A")
+        go(tools, store, session_id="A")
         hook = make_pre_stop(store)
         result = hook(session_id="A", platform="local", attempt=0)  # no conversation_id
         self.assertIsNotNone(result)
@@ -147,11 +430,11 @@ class F3ConversationKeyTest(unittest.TestCase):
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="A", conversation_id="C")
         transform = make_transform_llm_output(store)
+        # without the conversation id the rotated session finds no state
+        self.assertIsNone(transform(response_text="REPORT", session_id="B"))
         out = transform(response_text="REPORT", session_id="B", conversation_id="C")
         self.assertIn("REPORT", out)
         self.assertIn("Goal status:", out)
-        # without the conversation id the rotated session finds no state
-        self.assertIsNone(transform(response_text="REPORT", session_id="B"))
 
 
 class Goal2ToTheEndTest(unittest.TestCase):
@@ -160,7 +443,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
     def test_pre_stop_continues_while_open_goals_remain(self):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        tools.goal_go({}, **IDS)
+        go(tools, store, **IDS)
         hook = make_pre_stop(store)
         result = hook(session_id="s1", platform="api_server", attempt=0)
         self.assertEqual(result["action"], "continue")
@@ -171,7 +454,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
     def test_pre_stop_stops_when_all_goals_done(self):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        tools.goal_go({}, **IDS)
+        go(tools, store, **IDS)
         state = store.load(_chat_key("s1"))
         state.goals[0].done = True
         store.save(state)
@@ -182,7 +465,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="s1", platform="cron")
-        tools.goal_go({}, session_id="s1", platform="cron")
+        go(tools, store, session_id="s1", platform="cron")
         hook = make_pre_stop(store)
         self.assertIsNone(hook(session_id="s1", platform="cron", attempt=0))
 
@@ -192,7 +475,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="s1")            # tool call: no platform, as the dispatcher sends it
-        tools.goal_go({}, session_id="s1")
+        go(tools, store, session_id="s1")
         hook = make_pre_stop(store)
         result = hook(session_id="s1", platform="local", attempt=0)  # hook: agent.platform='local'
         self.assertIsNotNone(result)
@@ -204,7 +487,7 @@ class Goal2ToTheEndTest(unittest.TestCase):
         # tool and the pre_stop hook must agree on one key. We assert the state reloads by it.
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        tools.goal_go({}, **IDS)
+        go(tools, store, **IDS)
         reloaded = store.load(_chat_key("s1"))
         self.assertTrue(reloaded.go)
         self.assertEqual(reloaded.goals[0].id, "g1")
@@ -282,7 +565,7 @@ class F7SubagentExclusionTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="parent", conversation_id="conv-P")
-        tools.goal_go({}, session_id="parent", conversation_id="conv-P")
+        go(tools, store, session_id="parent", conversation_id="conv-P")
         before = store.load(_chat_key("conv-P")).continuations
         hook = make_pre_stop(store)
         # the judge child runs with platform=subagent and the INHERITED parent conversation id
@@ -362,14 +645,14 @@ class Goal3JudgeTest(unittest.TestCase):
 
 
 class Goal4DoneStaysDoneTest(unittest.TestCase):
-    """Goal 4: a confirmed goal stays done; each report shows all goals."""
+    """Goal 4: a confirmed goal stays done; the full list shows all goals."""
 
     def test_confirmed_goal_stays_done_and_pre_stop_skips_it(self):
         tools, store, _ = make_tools("VERDICT: done")
         tools.goal_set({"goals": [
             {"id": "g1", "text": "a", "check": "c1"}, {"id": "g2", "text": "b", "check": "c2"},
         ]}, **IDS)
-        tools.goal_go({}, **IDS)
+        go(tools, store, **IDS)
         tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s",
                          "checks": [{"command": "c1", "result": "passed", "exitCode": 0}]}}, **IDS)
         hook = make_pre_stop(store)
@@ -477,16 +760,31 @@ class F8StateDirTest(unittest.TestCase):
 
 
 class RegisterTest(unittest.TestCase):
-    def test_register_wires_six_tools_and_two_hooks(self):
+    def test_register_wires_six_tools_three_hooks_and_the_usage_hint(self):
         os.environ["GOAL_LOOP_STATE_DIR"] = tempfile.mkdtemp(prefix="goal-loop-reg-")
         try:
             ctx = FakeCtx()
             register(ctx)
-            names = {name for name, _, _ in ctx.tools}
+            names = {name for name, _, _, _ in ctx.tools}
             self.assertEqual(names, {"goal_set", "goal_go", "goal_status", "goal_claim",
                                      "goal_decision", "goal_block"})
-            self.assertIn("pre_stop", ctx.hooks)
-            self.assertIn("transform_llm_output", ctx.hooks)
+            self.assertEqual(set(ctx.hooks), {"pre_stop", "transform_llm_output", "pre_llm_call"})
+            self.assertIn(PROMPT_SECTION_ID, ctx.sections)
+            self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "api_server"}), USAGE_HINT)
+            self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "subagent"}), "")
+            status_schema = next(s for n, _, _, s in ctx.tools if n == "goal_status")
+            self.assertEqual(status_schema["description"], GOAL_STATUS_DESCRIPTION)
+        finally:
+            del os.environ["GOAL_LOOP_STATE_DIR"]
+
+    def test_register_works_without_the_prompt_section_api(self):
+        os.environ["GOAL_LOOP_STATE_DIR"] = tempfile.mkdtemp(prefix="goal-loop-reg2-")
+        try:
+            ctx = FakeCtx()
+            del ctx.sections
+            ctx.register_system_prompt_section = None
+            register(ctx)
+            self.assertEqual(len(ctx.tools), 6)
         finally:
             del os.environ["GOAL_LOOP_STATE_DIR"]
 
