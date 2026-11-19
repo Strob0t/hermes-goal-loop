@@ -145,6 +145,13 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
 
     def setUp(self):
         os.environ["GOAL_LOOP_STATE_DIR"] = tempfile.mkdtemp(prefix="goal-loop-it-")
+        # follow-up runs: a fake job maker and a temporary home, so no test makes a real cron job
+        from goal_loop import resume
+        self.jobs = []
+        self._resume = patch.multiple(resume, CREATE_JOB=lambda **kw: self.jobs.append(kw) or {"id": "it-job"},
+                                      HERMES_HOME=tempfile.mkdtemp(prefix="goal-loop-it-home-"))
+        self._resume.start()
+        self.addCleanup(self._resume.stop)
         self._saved = plugins_facade._plugin_manager
         self.manager = PluginManager()
         plugins_facade._plugin_manager = self.manager
@@ -158,6 +165,20 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
     def go(self, **ids):
         owner_message(ids.get("session_id"))
         return self.tools.goal_go({}, **ids)
+
+    def test_follow_up_run_is_scheduled_through_the_real_transform_and_cron_parser(self):
+        # L15: the real transform dispatch schedules one follow-up job; its schedule parses with the
+        # real cron parser of the fork as a one-shot.
+        from cron.jobs import parse_schedule
+        self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
+        self.go(**IDS)
+        agent = SimpleNamespace(session_id="it-sess", model="m", platform="api_server")
+        out, transformed, _ = apply_llm_output_transform(agent, "ANSWER", turn_id="t-resume")
+        self.assertTrue(transformed)
+        self.assertIn("follow-up run", out)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertTrue(self.jobs[0]["no_agent"])
+        self.assertEqual(parse_schedule(self.jobs[0]["schedule"])["kind"], "once")
 
     def test_hook_is_registered_in_the_real_manager(self):
         self.assertTrue(self.manager.has_hook("pre_stop"))

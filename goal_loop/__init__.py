@@ -73,6 +73,11 @@ DEFAULTS = {
     "language": "auto",
     "paused_hint": True,
     "stop_words": ["stopp", "stop", "halt", "pause", "pausiere", "abbrechen"],
+    # L15 follow-up runs (owner decision 5): a run that ends after the go with open goals
+    # schedules one more run of the same session; resume_max follow-up runs per go (0 = off).
+    "resume": True,
+    "resume_delay": "1m",
+    "resume_max": 20,
 }
 
 FINAL_REPORT_NUDGE = (
@@ -208,6 +213,11 @@ DECISION_TEXT = {
         "paused_line": "Der Loop ist pausiert: {n} Ziel(e) sind offen ({gids}). Schreibe 'weiter', "
                        "damit er fortfährt.",
         "owner_stop": "Der Loop ist auf deinen Wunsch pausiert. Mit 'go' geht es weiter.",
+        "resume_line": ("Der Loop läuft in {delay} in einem Folge-Run weiter: {n} Ziel(e) offen "
+                        "({gids}). Die Antwort erscheint in diesem Chat. Mit 'stopp' hältst du ihn an."),
+        "resume_max": ("Der Loop hat {n} Folge-Runs ohne Abschluss gemacht und ist pausiert "
+                       "(Ziele: {gids}). Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele "
+                       "ändern; C) die Ziele streichen. Empfehlung: A, wenn die Ziele Fortschritt zeigen."),
     },
     "en": {
         "budget": ("Goal {gid} reached the budget of {n} continuations and is paused. Options: "
@@ -223,6 +233,11 @@ DECISION_TEXT = {
                    "the goal. Recommendation: B, because the same way failed {n} times."),
         "paused_line": "The loop is paused: {n} goal(s) are open ({gids}). Write 'continue' to go on.",
         "owner_stop": "The loop is paused as you asked. Answer 'go' to continue.",
+        "resume_line": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open "
+                        "({gids}). The answer appears in this chat. Write 'stop' to halt it."),
+        "resume_max": ("The loop made {n} follow-up runs without completion and is paused "
+                       "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
+                       "C) remove the goals. Recommendation: A if the goals show progress."),
     },
 }
 
@@ -471,6 +486,7 @@ class _Tools:
         if not count:
             self.store.append_ledger(state.chat_key, "go_refused", owner_messages=count)
             return GO_REFUSED
+        state.resumes = 0  # a new go allows resume_max new follow-up runs
         for goal in paused:
             goal.status = "in_work"
             goal.note = ""
@@ -658,6 +674,7 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
         if store.gate_count(key, "stop") is not None:
             store.close_gate(key, "stop")
             state.go = False
+            _cancel_follow_up(store, state.chat_key)
             state.decisions.append(_dtext(lang)["owner_stop"])
             store.append_ledger(state.chat_key, "paused_by_owner")
             store.open_gate(key)
@@ -749,6 +766,39 @@ def _display_block(state: GoalState, language: str = "en") -> str:
     return owner_block(owner_goals, decisions, language)
 
 
+def _cancel_follow_up(store: GoalStore, chat_key: str) -> None:
+    """The owner stopped the loop: a scheduled follow-up run posts nothing (resume_run.due)."""
+    try:
+        from . import resume
+        path = resume.request_path(store.base_dir, chat_key)
+        request = resume.load_request(path)
+        if request and request.get("status") == "scheduled":
+            resume.mark(path, "cancelled")
+    except Exception:
+        logger.debug("goal-loop follow-up run not cancelled", exc_info=True)
+
+
+def _schedule_follow_up(store: GoalStore, state: GoalState, settings: Settings,
+                        session_id: str) -> bool:
+    """L15: schedule one follow-up run of this session (resume.py); False when off, at the
+    limit, still pending, or not possible (no session, no cron module)."""
+    limit = settings.get("resume_max")
+    if not settings.get("resume") or not limit or state.resumes >= limit:
+        return False
+    try:
+        from . import resume
+        job = resume.schedule_resume(store.base_dir, state.chat_key, str(session_id or ""),
+                                     state.last_model, str(settings.get("resume_delay") or "1m"))
+    except Exception:
+        logger.debug("goal-loop follow-up run not scheduled", exc_info=True)
+        return False
+    if not job:
+        return False
+    state.resumes += 1
+    store.append_ledger(state.chat_key, "resume_scheduled", job_id=job, n=state.resumes)
+    return True
+
+
 def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = None):
     """Append the goal display to the final answer of a turn, only when there is news."""
     settings = settings or Settings()
@@ -767,11 +817,23 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
         if not state.goals:
             return None
         lang = _language(state, store, settings, state.chat_key)
+        limit = settings.get("resume_max")
+        waiting = state.open_goals() if state.go else []
+        if waiting and settings.get("resume") and limit and state.resumes >= limit:
+            gids = ", ".join(g.id for g in waiting)
+            _pause(store, state, waiting, f"{state.resumes} follow-up runs without completion",
+                   _dtext(lang)["resume_max"].format(n=state.resumes, gids=gids), state.chat_key,
+                   "paused_resume_max")
         block = _display_block(state, lang)
         # L15: the turn ends while goals are still open after the go.
-        open_goals = state.open_goals() if state.go and settings.get("paused_hint") else []
+        open_goals = state.open_goals() if state.go else []
         tail = ""
-        if open_goals:
+        if open_goals and platform == "api_server" and _schedule_follow_up(store, state, settings,
+                                                                          session_id):
+            tail = "\n\n" + _dtext(lang)["resume_line"].format(
+                n=len(open_goals), gids=", ".join(g.id for g in open_goals),
+                delay=settings.get("resume_delay"))
+        elif open_goals and settings.get("paused_hint"):
             tail = "\n\n" + _dtext(lang)["paused_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals))
         if not block and not tail:
@@ -817,23 +879,51 @@ def _is_owner_message(user_message: Any, conversation_history: Any) -> bool:
     return True
 
 
+def _is_follow_up(store: GoalStore, session_id: Any, conversation_id: Any, text: str) -> bool:
+    """True for the turn of a follow-up run: it starts with the resume prefix (an owner who types
+    the prefix is treated the same way, which only withholds a go)."""
+    from . import resume
+    return resume.is_resume_text(text)
+
+
+def _note_model(store: GoalStore, gate: str, model: Any) -> None:
+    """Keep the model of the last owner turn, so a follow-up run uses the same model."""
+    if not model or not store.exists(gate):
+        return
+    state = store.load(gate)
+    if state.last_model != str(model):
+        state.last_model = str(model)
+        store.save(state)
+
+
 def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
     """For each owner message: count it for the go and change gates, mark it for this process
     (L13), detect a stop word (L8) and the language (O2), and return the goal context (L4)."""
     settings = settings or Settings()
 
     def _pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = None,
-                      conversation_history: Any = None, **_: Any) -> Optional[str]:
+                      conversation_history: Any = None, model: str = "", **_: Any) -> Optional[str]:
         if platform in EXCLUDED_PLATFORMS:
             return None
         try:
+            text = _message_text(user_message).strip()
+            if _is_follow_up(store, session_id, _.get("conversation_id"), text):
+                # L15: a follow-up run of the plugin is never an owner message (no go, no
+                # change approval, no restart re-arm); it gets the goal context.
+                key = _gate_for(store, session_id, _.get("conversation_id"))
+                if store.exists(key):
+                    state = store.load(key)
+                    if state.go and state.unfinished():
+                        return _goal_context(state, "[goal-loop] Goals of this chat (owner-approved; "
+                                                    "do not change them without the owner):")
+                return None
             if not _is_owner_message(user_message, conversation_history):
                 return None
             gate = _gate_for(store, session_id, _.get("conversation_id"))
             store.bump_gate(gate)
             store.bump_gate(gate, "change")
             store.open_gate(gate, f"boot{BOOT_ID[:12]}")
-            text = _message_text(user_message).strip()
+            _note_model(store, gate, model)
             store.add_language_vote(gate, detect_language(text))
             words = [str(w).lower() for w in (settings.get("stop_words") or [])]
             if text.lower().strip(" .!") in words:

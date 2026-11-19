@@ -116,6 +116,8 @@ class GoalState:
     nudge_seq: int = 0
     boot_id: str = ""
     language: str = ""
+    resumes: int = 0
+    last_model: str = ""
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -142,6 +144,8 @@ class GoalState:
             nudge_seq=int(data.get("nudge_seq", 0)),
             boot_id=str(data.get("boot_id", "")),
             language=str(data.get("language", "")),
+            resumes=int(data.get("resumes", 0)),
+            last_model=str(data.get("last_model", "")),
         )
 
     def goal(self, goal_id: str) -> Optional[Goal]:

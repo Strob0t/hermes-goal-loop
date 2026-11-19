@@ -44,7 +44,7 @@ there is news for the owner:
 | `goal_set` changed the list after the go (owner-approved) | the full list with each check and status |
 | after the go: a goal became blocked or paused, or a new owner decision | only these items (`Goal status (needs the owner):`), each one time |
 | progress, a goal in work, a judge rejection, a confirmed goal while others are open | nothing |
-| the turn ends after the go while goals are still open | one line: the loop is paused, write to continue (`paused_hint`) |
+| the turn ends after the go while goals are still open | one line: a follow-up run continues the loop (`resume`), else the loop is paused, write to continue (`paused_hint`) |
 | the judge confirmed the last goal | the full list with checkmarks, one time, with the final report |
 | after the final list, until a new `goal_set` | only a new owner decision, one time |
 
@@ -153,10 +153,37 @@ Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_j
   | `block_min_rounds` | 3 | rounds with the same obstacle before `goal_block` is accepted |
   | `judge_timeout` | 300 | seconds the judge child may run; a timeout keeps the goal status |
   | `language` | `auto` | `auto` (from the owner messages), `de` or `en` for the plugin labels |
-  | `paused_hint` | true | one line when a turn ends with open goals after the go |
+  | `paused_hint` | true | one line when a turn ends with open goals after the go and no follow-up run is scheduled |
   | `stop_words` | stopp, stop, halt, pause, pausiere, abbrechen | an owner message that is one of these pauses the loop |
+  | `resume` | true | follow-up runs (see **Follow-up runs**) |
+  | `resume_delay` | 1m | delay of a follow-up run after the end of a run |
+  | `resume_max` | 20 | follow-up runs per go; then pause + decision (0 = off) |
 - `GOAL_LOOP_STATE_DIR` — directory for per-chat state and ledger files
   (default `$HERMES_HOME/goal-loop`).
+
+## Follow-up runs
+
+A run ends at the turn limit of Hermes (`agent.max_turns`) or after
+`agent.max_stop_continuations`. When a run of an `api_server` chat ends after the go while goals
+are still open, the plugin schedules one more run of the same session, without an owner message:
+
+1. At the end of the turn (`transform_llm_output`) the plugin writes a request file
+   `resume_<chat>.json` (session id, model, a nonce), a small wrapper script
+   `$HERMES_HOME/scripts/goal-loop-resume-<hash>.py` and a one-shot `no_agent` cron job
+   (`cron.jobs.create_job`, schedule `in <resume_delay>`, `repeat` 1). The answer gets one line:
+   the loop continues in a follow-up run.
+2. The cron run executes `goal_loop/resume_run.py`. It posts nothing when the go was taken back,
+   no goal is open, Hermes started again after the request, or the request was used. Else it
+   posts one turn to the local API server with `X-Hermes-Session-Id` and `API_SERVER_KEY` (the
+   pattern of `gateway/wake.py` `_self_post_chat_completion`) and prints the answer.
+3. The printed answer is the cron run output. A cron delivery adapter that binds the job to the
+   chat where it was made shows it in that chat (homelab: `ki-delivery`, Open WebUI chat API).
+
+The follow-up turn starts with `[goal-loop resume <nonce>]`. `pre_llm_call` never counts it as an
+owner message, so it gives no go and no change approval; it gets the goal context. Limits:
+`budget_per_goal`, the idle pause, the stop word, `resume_max`, one pending request per chat. A
+new go resets the count. Hermes must have `API_SERVER_KEY` (file `/run/secrets/hermes_api_key`
+or env) and cron scripts enabled.
 
 ## Where the state lives
 
