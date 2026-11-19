@@ -13,15 +13,20 @@ patch the plugin's tools still work and the hook is simply never called.
 ## The five goals
 
 1. **Set goals and wait for the go.** `goal_set` records each goal with one falsifiable
-   check; the model shows the list and asks the owner. `goal_go` records the go. No loop
-   runs before the go. See **Go rule** below.
+   check of the content, in the owner's language; the plugin shows the list and the go
+   question one time. `goal_go` records the go. No loop runs before the go. See **Go rule**.
 2. **Run to the end.** The generic `pre_stop` hook keeps the turn going while open goals
-   remain, with no file edit, bounded by `agent.max_stop_continuations` (default 20). State
-   is keyed by chat, not by session id, so it survives a context compaction.
+   remain, bounded per turn by `agent.max_stop_continuations` (default 20) and per goal by
+   `budget_per_goal` over all turns and runs. Idle turns and repeated judge rejections first
+   ask the model to plan again, then pause the goal with an owner decision. State is keyed by
+   chat, not by session id, so it survives a context compaction; each owner turn gets the open
+   goals as context.
 3. **Judge with a fresh context.** `goal_claim` submits a structured completion claim; a
-   read-only child agent (fallback: a tool-less LLM call) checks the actual state, never
-   trusts the worker's report, and gives one actionable reason for each rejected goal.
-   A judge call that fails rejects the claim (fail closed).
+   read-only child agent on its own model task `goal_loop_judge` (fallback: a tool-less LLM
+   call on the same task) checks the actual state, never trusts the worker's report, and gives
+   the missing points for each rejected goal. A `pre_tool_call` guard vetoes writes of the
+   judge child. A judge that does not answer keeps the goal status; `wait` keeps it open
+   without nudges.
 4. **Done stays done.** Only the judge sets a goal `done`. The chat shows the goal list
    quietly (see **What the chat shows** below).
 5. **Decisions as text.** `goal_decision` records an owner decision (options + a
@@ -35,11 +40,16 @@ there is news for the owner:
 
 | Event in the turn | Block in the answer |
 |---|---|
-| `goal_set` set or changed the list (before or after the go) | the full list with each check and status |
-| after the go: a goal became blocked (`goal_block`) or a new owner decision (`goal_decision`) | only these items (`Goal status (needs the owner):`), each one time |
+| `goal_set` set the list (before the go) | the full list with each check and status, then the go question as the last line; the model does not repeat the list |
+| `goal_set` changed the list after the go (owner-approved) | the full list with each check and status |
+| after the go: a goal became blocked or paused, or a new owner decision | only these items (`Goal status (needs the owner):`), each one time |
 | progress, a goal in work, a judge rejection, a confirmed goal while others are open | nothing |
+| the turn ends after the go while goals are still open | one line: the loop is paused, write to continue (`paused_hint`) |
 | the judge confirmed the last goal | the full list with checkmarks, one time, with the final report |
-| after the final list, until a new `goal_set` | only a new owner decision (`goal_decision`), one time; otherwise nothing |
+| after the final list, until a new `goal_set` | only a new owner decision, one time |
+
+Labels follow the owner language (`language`: `auto` from the owner messages, `de` or `en`).
+Goal text and check are written by the model in the owner language (usage hint).
 
 The state file records what the chat has shown (`list_changed`, `final_shown`,
 `decisions_shown`, `block_shown` for each goal). A state file of an older plugin version
@@ -80,37 +90,43 @@ for each incoming turn (`agent/turn_context.py`, `_collect_pre_llm_call_context`
 never for a `pre_stop` continuation inside a turn. An API client turn counts also when
 the session authority stores its user row as `internal_notification` with
 `display_metadata.api_inbound` (`gateway/session_ingress.py`). These turns do not count: a
-gateway notification (the text ends with the `[INTERNAL NOTIFICATION ...]` footer), a
-gateway wake self-post such as a kanban wake (`gateway/wake.py`; the fork patch marks it
-`hermes_wake`, so its row gets no `api_inbound` flag), a turn whose user row has another
-synthesized `display_kind` (a typed `/steer` row counts), an empty turn, and the `cron`
-and `subagent` platforms.
-
-The count is kept in `gate_<key>.json` in the state folder. The key is the
-compression-stable `conversation_id`, which the fork patch hands to `pre_llm_call`; so a
-compaction that rotates the session id between `goal_set` and the go keeps the gate.
-`goal_set` opens the gate also under the session id, and `goal_go` reads both: on a Hermes
-without the patch the hook gives only the session id, and the gate then follows the
-session id (a rotation in that case needs a new `goal_set`).
+gateway notification (the text ends with the `[INTERNAL NOTIFICATION ...]` footer), a turn
+whose user row has another synthesized `display_kind` (a typed `/steer` row counts), an
+empty turn, and the `cron` and `subagent` platforms. The count is kept in
+`gate_<chat>.json` in the state folder, keyed on the chat (see "Where the state lives").
+After the go, a changed goal list needs one more owner message (`change_<chat>.json`), and a
+paused goal resumes with `goal_go` after a new owner message.
 
 ## Usage hint
 
 The plugin adds a short section to the system prompt of each new session
 (`PluginContext.register_system_prompt_section`, rendered by
-`agent/system_prompt.py` `_frozen_plugin_prompt_sections`): for a multi-step task, call
-`goal_set` first, then show the list and wait for the owner's go. The section is empty, and
+`agent/system_prompt.py` `_frozen_plugin_prompt_sections`): goal text and check in the
+owner's language, content checks that the judge can examine at claim time, the live version
+as the base, large goals split, no repeated list and no own go question, `goal_go` only after
+the owner's go, progress with `goal_progress`. The section is empty, and
 so not rendered, for the platforms in `EXCLUDED_PLATFORMS` (`cron`, `subagent`, which
 includes the judge). Hermes renders the section one time per session, so a session that
 started before the plugin update gets the hint only after a new session.
 
 ## Tools
 
-`goal_set`, `goal_go`, `goal_status`, `goal_claim`, `goal_decision`, `goal_block`.
+`goal_set`, `goal_go`, `goal_status`, `goal_claim`, `goal_progress`, `goal_decision`, `goal_block`.
+
+- `goal_set` after the go is refused until an owner message approves the change; judge-confirmed goals stay done.
+- `goal_block` needs a reason and is accepted only when the same obstacle stays for `block_min_rounds` continuation rounds.
+- `goal_progress` records the last step, its evidence and the next step; the goal context of each turn shows it.
+- `goal_go` also resumes paused goals (budget, idle, rejections, stop word, restart).
 
 ## Hooks
 
-`pre_stop` (continuation), `transform_llm_output` (status display) and `pre_llm_call`
-(owner-message count for the go rule). Plus one system-prompt section (`goal-loop`).
+- `pre_stop`: continuation with the open goals (text, check, progress), budget, idle and restart limits.
+- `transform_llm_output`: status display in the owner language; one line when a turn ends with open goals.
+- `pre_llm_call`: owner-message count (go and change gates), stop words, language votes, goal context for each owner turn.
+- `post_tool_call`: tool-call count for the idle detection.
+- `pre_tool_call`: read-only guard for the judge child.
+
+Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_judge`.
 
 ## Requires
 
@@ -118,15 +134,27 @@ started before the plugin update gets the hint only after a new session.
 - The companion fork patch that adds the generic `pre_stop` stop-gate hook
   (`patch_stop_hook.py` on the `goal-loop-patches` branch of the Hermes fork). The plugin
   degrades to tools-only without it.
-- For the go rule across a compaction and for kanban wakes: the fork commit that hands
-  `conversation_id` to `pre_llm_call` and marks wake self-posts `hermes_wake`
-  (`local-tests/test_wake_gate.py` on `goal-loop-patches`). Without it the go rule still
-  works, keyed on the session id.
 
 ## Config
 
 - `agent.max_stop_continuations` — bound on consecutive `pre_stop` continuations per turn
   (default 20).
+- `auxiliary.goal_loop_judge` — provider and model of the judge (subagent and fallback path). Use a
+  model family that is not the worker's (self-preference bias, arXiv 2404.13076).
+- `plugins.entries.goal-loop.settings` (all optional):
+
+  | Key | Default | Effect |
+  |---|---|---|
+  | `budget_per_goal` | 50 | continuations per goal over all turns and runs; then pause + decision (0 = off) |
+  | `idle_replan_after` | 2 | continuations without a tool call before a request to plan again |
+  | `idle_pause_after` | 3 | continuations without a tool call before a pause + decision (0 = off) |
+  | `reject_replan_after` | 2 | similar judge rejections before a request to plan again |
+  | `reject_pause_after` | 3 | similar judge rejections before a pause + decision (0 = off) |
+  | `block_min_rounds` | 3 | rounds with the same obstacle before `goal_block` is accepted |
+  | `judge_timeout` | 300 | seconds the judge child may run; a timeout keeps the goal status |
+  | `language` | `auto` | `auto` (from the owner messages), `de` or `en` for the plugin labels |
+  | `paused_hint` | true | one line when a turn ends with open goals after the go |
+  | `stop_words` | stopp, stop, halt, pause, pausiere, abbrechen | an owner message that is one of these pauses the loop |
 - `GOAL_LOOP_STATE_DIR` — directory for per-chat state and ledger files
   (default `$HERMES_HOME/goal-loop`).
 
@@ -143,7 +171,10 @@ follows the chat either way. With the rotating path (`compression.in_place: fals
 the session id changes at every compaction; the plugin then keys on the
 compression-stable `conversation_id` (with the session id as fallback), so the loop
 continues in the rotated session. Keying on `conversation_id` is harmless with
-`in_place: true`. The go gate uses the same `conversation_id` key (see **Go rule**).
+`in_place: true`. The go gate is keyed on the chat as well: `pre_llm_call` gets no
+`conversation_id` in the fork, so the plugin maps the session to its chat (each goal tool
+call and each `pre_stop` call records the mapping). A rotation between `goal_set` and the go
+needs one more owner message only when no tool call of the new session ran before it.
 
 ## Tests
 

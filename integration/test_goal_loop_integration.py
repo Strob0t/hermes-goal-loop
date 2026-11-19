@@ -295,7 +295,7 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
                 ctx = load_real_plugin(manager)  # register() fixes the store NOW
                 out = ctx.dispatch_tool("goal_set", {"goals": [{"id": "g1", "text": "x",
                                                                 "check": "c"}]}, session_id=sid)
-                self.assertIn("g1", out)
+                self.assertIn("Goals recorded", out)
                 self.assertTrue(os.path.isfile(os.path.join(fake_home, "goal-loop", chat_file)),
                                 "state must be under $HERMES_HOME/goal-loop")
                 # with HOME patched, ~/.hermes expands into fake_user
@@ -357,9 +357,12 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         owner_message("it-sess", "Go")
         self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
         tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **IDS)
-        final, transformed, _ = turn("PROGRESS")                    # progress only: quiet
-        self.assertFalse(transformed)
-        self.assertEqual(final, "PROGRESS")
+        final, transformed, _ = turn("PROGRESS")                    # progress only: no goal block
+        # v0.3 (L15): the turn ends while g2 is open, so only the paused-loop line is added
+        self.assertTrue(transformed)
+        self.assertTrue(final.startswith("PROGRESS"))
+        self.assertIn("goal(s) are open (g2)", final)
+        self.assertNotIn("- [ ] g1: a", final)
         out = tools.goal_claim({"goal_id": "g2", "claim": {"summary": "s", **CHECKS}}, **IDS)
         self.assertIn("All goals are now confirmed", out)
         final, transformed, _ = turn("FINAL REPORT")                # turn 1: all confirmed

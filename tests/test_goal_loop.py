@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from goal_loop import (
-    EXCLUDED_PLATFORMS, FINAL_REPORT_NUDGE, GO_REFUSED, GOAL_STATUS_DESCRIPTION, NO_REPORT_MARKER,
+    CHANGE_REFUSED, Settings, EXCLUDED_PLATFORMS, FINAL_REPORT_NUDGE, GO_REFUSED, GOAL_STATUS_DESCRIPTION, NO_REPORT_MARKER,
     PROMPT_SECTION_ID, STOP_CAUSES, USAGE_HINT, _Tools, _chat_key, _state_dir, make_pre_llm_call,
     make_pre_stop, make_transform_llm_output, prompt_section, register,
 )
@@ -88,6 +88,8 @@ def make_tools(verdict_text="VERDICT: done"):
 
 
 IDS = {"session_id": "s1", "platform": "api_server"}
+# display tests that look only at the goal block, not at the paused-loop line (L15)
+QUIET = Settings(overrides={"paused_hint": False})
 CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
 
 
@@ -118,8 +120,9 @@ class Goal1BeforeWorkTest(unittest.TestCase):
             {"id": "g1", "text": "branch exists", "check": "git rev-parse g1"},
             {"id": "g2", "text": "tests pass", "check": "pytest -q"},
         ]}, **IDS)
-        self.assertIn("g1", out)
-        self.assertIn("check: git rev-parse g1", out)
+        # O1: the tool answer does not carry the list; the plugin appends it one time
+        self.assertNotIn("git rev-parse g1", out)
+        self.assertIn("Do not repeat the list", out)
         self.assertIn("No loop runs before goal_go", out)
         state = store.load(_chat_key("s1"))
         self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
@@ -170,8 +173,14 @@ class GoRuleTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         self.assertTrue(go(tools, store, **IDS).startswith("Go recorded"))
-        tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]}, **IDS)
-        self.assertEqual(tools.goal_go({}, **IDS), GO_REFUSED)
+        # L3: a change after the go needs the owner's approval in a new message
+        self.assertEqual(tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]}, **IDS),
+                         CHANGE_REFUSED)
+        self.assertEqual(store.load(_chat_key("s1")).goal("g1").text, "x")
+        owner_says(store, "s1", "ok, change it")
+        self.assertIn("changed", tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]},
+                                                **IDS))
+        self.assertEqual(store.load(_chat_key("s1")).goal("g1").text, "y")
 
     def test_notification_subagent_and_cron_turns_do_not_count(self):
         tools, store, _ = make_tools()
@@ -258,7 +267,7 @@ class DisplayOnSetAndChangeTest(unittest.TestCase):
 
     def setUp(self):
         self.tools, self.store, _ = make_tools("VERDICT: not-done the file is missing")
-        self.transform = make_transform_llm_output(self.store)
+        self.transform = make_transform_llm_output(self.store, QUIET)
 
     def answer(self, text="ANSWER"):
         return self.transform(response_text=text, **IDS)
@@ -276,6 +285,10 @@ class DisplayOnSetAndChangeTest(unittest.TestCase):
         self.answer()
         go(self.tools, self.store, **IDS)
         self.assertIsNone(self.answer())
+        # L3: the first try is refused (the model asks), then the owner approves the change
+        self.assertEqual(self.tools.goal_set({"goals": [{"id": "g2", "text": "b", "check": "c2"}]},
+                                             **IDS), CHANGE_REFUSED)
+        owner_says(self.store, "s1", "add g2")
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                        {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
         out = self.answer()
@@ -303,7 +316,8 @@ class AfterGoOwnerItemsTest(unittest.TestCase):
 
     def setUp(self):
         self.tools, self.store, _ = make_tools("VERDICT: not-done no evidence")
-        self.transform = make_transform_llm_output(self.store)
+        self.tools.settings = Settings(overrides={"block_min_rounds": 1})
+        self.transform = make_transform_llm_output(self.store, QUIET)
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                        {"id": "g2", "text": "b", "check": "c2"},
                                        {"id": "g3", "text": "c", "check": "c3"}]}, **IDS)
@@ -652,7 +666,7 @@ class Goal3JudgeTest(unittest.TestCase):
         self.assertTrue(store.load(_chat_key("s1")).goal("g1").done)
         # the judge saw the goal + evidence as data, with temperature 0 and the goal_judge task
         self.assertTrue(ctx.llm.calls)
-        self.assertEqual(ctx.llm.calls[0][1].get("task"), "goal_judge")
+        self.assertEqual(ctx.llm.calls[0][1].get("task"), "goal_loop_judge")
 
     def test_judge_rejection_gives_a_reason_and_keeps_goal_open(self):
         tools, store, _ = make_tools("VERDICT: not-done the branch has no commits")
@@ -805,15 +819,16 @@ class F8StateDirTest(unittest.TestCase):
 
 
 class RegisterTest(unittest.TestCase):
-    def test_register_wires_six_tools_three_hooks_and_the_usage_hint(self):
+    def test_register_wires_seven_tools_five_hooks_and_the_usage_hint(self):
         os.environ["GOAL_LOOP_STATE_DIR"] = tempfile.mkdtemp(prefix="goal-loop-reg-")
         try:
             ctx = FakeCtx()
             register(ctx)
             names = {name for name, _, _, _ in ctx.tools}
             self.assertEqual(names, {"goal_set", "goal_go", "goal_status", "goal_claim",
-                                     "goal_decision", "goal_block"})
-            self.assertEqual(set(ctx.hooks), {"pre_stop", "transform_llm_output", "pre_llm_call"})
+                                     "goal_decision", "goal_block", "goal_progress"})
+            self.assertEqual(set(ctx.hooks), {"pre_stop", "transform_llm_output", "pre_llm_call",
+                                              "post_tool_call", "pre_tool_call"})
             self.assertIn(PROMPT_SECTION_ID, ctx.sections)
             self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "api_server"}), USAGE_HINT)
             self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "subagent"}), "")
@@ -829,7 +844,7 @@ class RegisterTest(unittest.TestCase):
             del ctx.sections
             ctx.register_system_prompt_section = None
             register(ctx)
-            self.assertEqual(len(ctx.tools), 6)
+            self.assertEqual(len(ctx.tools), 7)
         finally:
             del os.environ["GOAL_LOOP_STATE_DIR"]
 
