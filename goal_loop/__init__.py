@@ -886,6 +886,19 @@ def _is_follow_up(store: GoalStore, session_id: Any, conversation_id: Any, text:
     return resume.is_resume_text(text)
 
 
+def _take_request(store: GoalStore, key: str, text: str) -> None:
+    """The follow-up turn of request N started: mark N as taken, so the end of this turn can
+    schedule the next follow-up run (a request that is only "running" still blocks a new one)."""
+    try:
+        from . import resume
+        path = resume.request_path(store.base_dir, key)
+        request = resume.load_request(path)
+        if request and request.get("nonce") == resume.nonce_of(text):
+            resume.mark(path, "taken")
+    except Exception:
+        logger.debug("goal-loop follow-up request not marked", exc_info=True)
+
+
 def _note_model(store: GoalStore, gate: str, model: Any) -> None:
     """Keep the model of the last owner turn, so a follow-up run uses the same model."""
     if not model or not store.exists(gate):
@@ -911,6 +924,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 # L15: a follow-up run of the plugin is never an owner message (no go, no
                 # change approval, no restart re-arm); it gets the goal context.
                 key = _gate_for(store, session_id, _.get("conversation_id"))
+                _take_request(store, key, text)
                 if store.exists(key):
                     state = store.load(key)
                     if state.go and state.unfinished():

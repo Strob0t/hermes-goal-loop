@@ -116,6 +116,33 @@ class ScheduleTest(Base):
         self.assertEqual(self.store.load(_chat_key("c1")).resumes, 0)
 
 
+class ChainTest(Base):
+    def test_the_follow_up_turn_schedules_the_next_follow_up_run(self):
+        # live finding 2026-11-19: the request was still "running" (the post waits for the turn),
+        # so the end of the follow-up turn scheduled nothing and the chain stopped after 1 run.
+        self.started(("g1",))
+        transform = make_transform_llm_output(self.store, Settings(self.ctx))
+        transform(response_text="A", **IDS)
+        path = resume.request_path(self.store.base_dir, _chat_key("c1"))
+        first = resume.load_request(path)
+        resume.mark(path, "running")  # resume_run.main before the post
+        owner(self.store, resume.RESUME_PREFIX + first["nonce"] + "] Follow-up run")
+        self.assertEqual(resume.load_request(path)["status"], "taken")
+        out = transform(response_text="B", **IDS)
+        self.assertIn("follow-up run", out)
+        self.assertEqual(len(self.jobs.calls), 2)
+        second = resume.load_request(path)
+        self.assertNotEqual(second["nonce"], first["nonce"])
+        self.assertEqual(second["status"], "scheduled")
+
+    def test_a_foreign_nonce_does_not_take_the_request(self):
+        self.started(("g1",))
+        make_transform_llm_output(self.store, Settings(self.ctx))(response_text="A", **IDS)
+        path = resume.request_path(self.store.base_dir, _chat_key("c1"))
+        owner(self.store, resume.RESUME_PREFIX + "other] Follow-up run")
+        self.assertEqual(resume.load_request(path)["status"], "scheduled")
+
+
 class StopWordCancelsTest(Base):
     def test_a_stop_word_cancels_a_scheduled_follow_up_run(self):
         from goal_loop import make_pre_stop
