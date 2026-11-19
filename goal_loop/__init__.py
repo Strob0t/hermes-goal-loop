@@ -651,6 +651,20 @@ def _goal_context(state: GoalState, lead: str) -> str:
     return "\n".join(lines)
 
 
+def _apply_owner_stop(store: GoalStore, state: GoalState, key: str, lang: str) -> None:
+    """L8: the owner wrote a stop word: take the go back, cancel a pending follow-up run, record
+    it. Runs at the owner message (pre_llm_call) and again in pre_stop, at most 1 time per stop."""
+    store.close_gate(key, "stop")
+    if not state.go:
+        return
+    state.go = False
+    _cancel_follow_up(store, state.chat_key)
+    state.decisions.append(_dtext(lang)["owner_stop"])
+    store.append_ledger(state.chat_key, "paused_by_owner")
+    store.open_gate(key)
+    store.save(state)
+
+
 def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
     """Build the ``pre_stop`` callback: continue while open goals remain and the go is given."""
     settings = settings or Settings()
@@ -672,13 +686,7 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
         lang = _language(state, store, settings, key)
         # L8: the owner asked to stop.
         if store.gate_count(key, "stop") is not None:
-            store.close_gate(key, "stop")
-            state.go = False
-            _cancel_follow_up(store, state.chat_key)
-            state.decisions.append(_dtext(lang)["owner_stop"])
-            store.append_ledger(state.chat_key, "paused_by_owner")
-            store.open_gate(key)
-            store.save(state)
+            _apply_owner_stop(store, state, key, lang)
             return None
         # L13: after a restart only an owner message of this process re-arms the loop.
         if state.boot_id != BOOT_ID:
@@ -825,8 +833,10 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
                    _dtext(lang)["resume_max"].format(n=state.resumes, gids=gids), state.chat_key,
                    "paused_resume_max")
         block = _display_block(state, lang)
-        # L15: the turn ends while goals are still open after the go.
-        open_goals = state.open_goals() if state.go else []
+        # L15: the turn ends while goals are still open after the go. L13: a state that a
+        # different process drove is held after a restart, so it gets no follow-up run either.
+        held = bool(state.boot_id) and state.boot_id != BOOT_ID
+        open_goals = state.open_goals() if state.go and not held else []
         tail = ""
         if open_goals and platform == "api_server" and _schedule_follow_up(store, state, settings,
                                                                           session_id):
@@ -989,6 +999,13 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             words = [str(w).lower() for w in (settings.get("stop_words") or [])]
             if text.lower().strip(" .!") in words:
                 store.open_gate(gate, "stop")
+                # Apply it now: the pre_stop hook may not run again in this turn (the fork
+                # counter agent._pre_stop_nudges is not reset per turn).
+                if store.exists(gate):
+                    state = store.load(gate)
+                    _apply_owner_stop(store, state, gate,
+                                      _language(state, store, settings, gate))
+                return None
             key = gate
             if not store.exists(key):
                 return None

@@ -82,6 +82,17 @@ class ScheduleTest(Base):
         events = [e["event"] for e in self.store.read_ledger(_chat_key("c1"))]
         self.assertIn("resume_scheduled", events)
 
+    def test_a_held_state_after_a_restart_gets_no_follow_up_run(self):
+        import goal_loop
+        self.started()
+        state = self.store.load(_chat_key("c1"))
+        state.boot_id = "an-other-process"
+        self.store.save(state)
+        out = make_transform_llm_output(self.store, Settings(self.ctx))(response_text="A", **IDS)
+        self.assertEqual(self.jobs.calls, [])
+        self.assertNotIn("follow-up run", out or "")
+        self.assertNotEqual(goal_loop.BOOT_ID, "an-other-process")
+
     def test_a_pending_request_is_not_scheduled_again(self):
         self.started()
         transform = make_transform_llm_output(self.store, Settings(self.ctx))
@@ -153,6 +164,24 @@ class StopWordCancelsTest(Base):
         request = resume.load_request(resume.request_path(self.store.base_dir, _chat_key("c1")))
         self.assertEqual(request["status"], "cancelled")
         self.assertFalse(self.store.load(_chat_key("c1")).go)
+
+    def test_the_stop_word_pauses_at_the_owner_message_without_pre_stop(self):
+        # Live 18:35: pre_stop did not run any more (fork counter used up), so the stop must act
+        # in pre_llm_call.
+        self.started(("g1",))
+        make_transform_llm_output(self.store, Settings(self.ctx))(response_text="A", **IDS)
+        out = owner(self.store, "stopp")
+        self.assertIsNone(out)
+        state = self.store.load(_chat_key("c1"))
+        self.assertFalse(state.go)
+        request = resume.load_request(resume.request_path(self.store.base_dir, _chat_key("c1")))
+        self.assertEqual(request["status"], "cancelled")
+        events = [e["event"] for e in self.store.read_ledger(_chat_key("c1"))]
+        self.assertEqual(events.count("paused_by_owner"), 1)
+        from goal_loop import make_pre_stop
+        self.assertIsNone(make_pre_stop(self.store, Settings(self.ctx))(attempt=0, **IDS))
+        events = [e["event"] for e in self.store.read_ledger(_chat_key("c1"))]
+        self.assertEqual(events.count("paused_by_owner"), 1)
 
 
 class FollowUpIsNoOwnerMessageTest(Base):
