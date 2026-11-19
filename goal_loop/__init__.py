@@ -46,7 +46,7 @@ from typing import Any, Mapping, Optional
 
 from .claim import ClaimError, serialize_completion_claim
 from .judge import JUDGE_TASK, run_judge
-from .state import Goal, GoalState, GoalStore, labels, owner_block, status_block
+from .state import LABELS, Goal, GoalState, GoalStore, labels, owner_block, status_block
 
 logger = logging.getLogger("goal_loop")
 
@@ -842,11 +842,58 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             store.save(state)
         except Exception:
             logger.debug("goal display state save failed", exc_info=True)
+        if block:
+            # One goal block per answer: the model imitates the stored plugin blocks of earlier turns.
+            body = strip_model_blocks(body, go_question=_GO_LINE.search(block) is not None)
         if not body.strip():
             body = labels(lang)["no_report"]
         return body + tail + ("\n" + block if block else "")
 
     return _transform
+
+
+# Lines of a goal block that the model wrote itself (all languages of state.LABELS).
+_TITLE_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(
+    re.escape(lab[key]) for lab in LABELS.values() for key in ("title", "title_owner")))
+_DECISIONS_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(re.escape(lab["decisions"]) for lab in LABELS.values()))
+_GOAL_LINE = re.compile(r"^\s*- \[[ xX]\] \S+:")
+_NUMBERED_LINE = re.compile(r"^\s*\d+\.\s")
+_GO_LINE = re.compile(r"^\s*(%s|Reply \W?go\W? to start\.?|Antworte mit \W?go\W?.*)\s*$" % "|".join(
+    re.escape(lab["go_question"]) for lab in LABELS.values()), re.IGNORECASE | re.MULTILINE)
+
+
+def strip_model_blocks(body: str, go_question: bool = False) -> str:
+    """Remove goal blocks that the model wrote into its own text: a title line of a plugin label,
+    then goal lines, a decisions heading with numbered lines, go lines and blank lines; the ``---``
+    line before the title goes too. With ``go_question`` (the plugin block asks for the go), also
+    remove go lines elsewhere, so that the go question is the last line of the answer, one time."""
+    lines = body.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if _TITLE_LINE.match(lines[i]):
+            while out and not out[-1].strip():
+                out.pop()
+            if out and out[-1].strip() == "---":
+                out.pop()
+            i += 1
+            in_decisions = False
+            while i < len(lines):
+                line = lines[i]
+                if _DECISIONS_LINE.match(line):
+                    in_decisions = True
+                elif not (not line.strip() or _GOAL_LINE.match(line) or _GO_LINE.fullmatch(line)
+                          or (in_decisions and _NUMBERED_LINE.match(line))):
+                    break
+                i += 1
+            continue
+        if go_question and _GO_LINE.fullmatch(lines[i]):
+            i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    text = "\n".join(out)
+    return re.sub(r"\n{3,}", "\n\n", text).rstrip()
 
 
 # --- The go gate, stop words, language and goal context (pre_llm_call) ------------------------
