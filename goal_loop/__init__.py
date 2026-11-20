@@ -554,6 +554,7 @@ class _Tools:
         state.go = True
         state.idle_nudges = 0
         state.tool_calls_at_nudge = -1
+        state.decisions_at_nudge = len(state.decisions)  # 0.4.3: base of the owner wait
         state.boot_id = BOOT_ID
         self.store.append_ledger(state.chat_key, "go", owner_messages=count,
                                  resumed=[g.id for g in paused])
@@ -755,11 +756,12 @@ def _builtin_goal_active(session_id: str) -> bool:
 
 
 def _owner_wait(state: GoalState) -> bool:
-    """All open goals wait for the owner: every one got a goal_block in the latest round AND a
-    goal_decision was recorded since the last continuation (a bare goal_block is only a try)."""
+    """All open goals wait for the owner: since the last owner message (or go) every open goal got a
+    goal_block AND at least one goal_decision was recorded (a bare goal_block is only a try).
+    The two calls may come in different rounds (live test 20:4x: decision in round 2, block in 6)."""
     open_goals = state.open_goals()
     return (bool(open_goals) and len(state.decisions) > state.decisions_at_nudge
-            and all(g.block_tries >= 1 and g.block_seq == state.nudge_seq for g in open_goals))
+            and all(g.block_tries >= 1 and g.block_seq >= 0 for g in open_goals))
 
 
 def _wait_reason(state: GoalState, session_id: str) -> str:
@@ -863,7 +865,6 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             return None
         if state.wait_reason:
             state.wait_reason = ""
-        state.decisions_at_nudge = len(state.decisions)
         state.nudge_seq += 1
         state.continuations = attempt + 1
         # 0.4.2: every continuation is visible in the ledger (also after a stop turn).

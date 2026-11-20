@@ -123,7 +123,7 @@ class GoalState:
     tool_calls_at_resume: int = -1
     idle_resumes: int = 0
     wait_reason: str = ""
-    decisions_at_nudge: int = 0
+    decisions_at_nudge: int = 0  # decisions at the last owner message or go (owner-wait base)
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.

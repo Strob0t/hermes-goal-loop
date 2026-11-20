@@ -351,6 +351,33 @@ class WaitBarrierTest(unittest.TestCase):
             self.assertIsNone(stop(store, s))
         self.assertIn("waiting_owner", ledger_events(store))
 
+    def test_decision_and_block_in_different_rounds_still_wait_for_the_owner(self):
+        tools, store, s = self._ready()
+        with fake_modules():
+            self.assertEqual(stop(store, s)["action"], "continue")
+            tools.goal_decision({"text": "A/B/C"}, **IDS)
+            tool(store, "goal_decision")
+            self.assertEqual(stop(store, s)["action"], "continue")  # goal not blocked yet
+            tool(store, "terminal")
+            self.assertEqual(stop(store, s)["action"], "continue")
+            tools.goal_block({"goal_id": "g1", "reason": "owner decision missing"}, **IDS)
+            tool(store, "goal_block")
+            self.assertIsNone(stop(store, s))
+        self.assertIn("waiting_owner", ledger_events(store))
+
+    def test_an_old_decision_before_the_go_is_no_owner_wait(self):
+        tools, store, _, s = setup(idle_pause_after=0)
+        tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c"}]}, **IDS)
+        tools.goal_decision({"text": "old"}, **IDS)
+        owner(store, "go", settings=s)
+        tools.goal_go({}, **IDS)
+        tool(store)
+        with fake_modules():
+            self.assertEqual(stop(store, s)["action"], "continue")
+            tools.goal_block({"goal_id": "g1", "reason": "tried"}, **IDS)
+            tool(store, "goal_block")
+            self.assertEqual(stop(store, s)["action"], "continue")
+
     def test_a_goal_block_without_a_decision_is_no_owner_wait(self):
         tools, store, s = self._ready()
         with fake_modules():
