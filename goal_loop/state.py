@@ -118,6 +118,10 @@ class GoalState:
     boot_id: str = ""
     language: str = ""
     resumes: int = 0
+    # 0.4.2: idle follow-up runs in a row (no tool call since the last follow-up run); only an
+    # owner message resets it, so a chat that waits only for the owner pauses after a few runs.
+    tool_calls_at_resume: int = -1
+    idle_resumes: int = 0
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.
@@ -150,6 +154,8 @@ class GoalState:
             boot_id=str(data.get("boot_id", "")),
             language=str(data.get("language", "")),
             resumes=int(data.get("resumes", 0)),
+            tool_calls_at_resume=int(data.get("tool_calls_at_resume", -1)),
+            idle_resumes=int(data.get("idle_resumes", 0)),
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),

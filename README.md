@@ -191,6 +191,14 @@ true`; without it the ledger has `resume_inject_refused` and the answer ends wit
 follow-up turn and an owner message start a new idle count, so a cut at the limit is no idle round.
 Limits: `resume_max`, `budget_per_goal`, the stop word.
 
+Since 0.4.2 the follow-up turns themselves are counted: a follow-up turn without a tool call is idle,
+and `idle_pause_after` idle follow-up turns in a row pause the goals (`paused_idle`); only an owner
+message resets this count. So a chat whose open goals only wait for owner decisions stops after a few
+runs, not after `resume_max`. Each `pre_stop` continuation writes the ledger event `continued`
+(`attempt`, open goal ids). The goal context of `pre_llm_call` carries its time ("Goals of this chat at
+HH:MM"): Hermes stores this context with the owner message and sends it again in later turns, so an
+old copy is visible as old.
+
 ## Parent session (goal adoption)
 
 A chat without its own goal state takes over the state of its nearest ancestor session with goals

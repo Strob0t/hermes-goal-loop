@@ -1,5 +1,5 @@
 name: goal-loop
-version: 0.4.1
+version: 0.4.2
 description: "Goal loop for Hermes: set goals with content checks in the owner's language, go only after an owner message, work to the end via a generic pre_stop hook with budget, idle, stall and restart limits, verify each goal with a read-only fresh-context judge on its own model task, keep done goals done, and show the goal list quietly in the owner's language. Needs the companion fork patch for the pre_stop stop-gate hook."
 author: Strob0t
 kind: backend

@@ -5,7 +5,7 @@ import unittest
 
 import goal_loop
 from goal_loop import make_pre_llm_call, make_transform_llm_output, resume_run
-from tests.test_v03 import owner, set_and_go, setup, stop
+from tests.test_v03 import owner, set_and_go, setup, stop, tool
 
 LOCAL = {"session_id": "s1", "platform": "cli"}
 
@@ -104,6 +104,55 @@ class IdleAfterLimitTest(unittest.TestCase):
         stop(store, s, 0)
         state = store.load(tools._load({"session_id": "s1"}).chat_key)
         self.assertNotEqual(state.goal("g1").status, "paused")
+
+
+class IdleFollowUpChainTest(unittest.TestCase):
+    """0.4.2: follow-up runs without a tool call pause the loop; an owner message resets it."""
+    def setUp(self):
+        self._saved = goal_loop._CTX
+        self.addCleanup(setattr, goal_loop, "_CTX", self._saved)
+
+    def run_ends(self, n, tools_between=False, **settings):
+        tools, store, _, s = setup(idle_pause_after=3, **settings)
+        set_and_go(tools, store)
+        goal_loop._CTX = Ctx()
+        for _ in range(n):
+            if tools_between:
+                tool(store)
+            make_transform_llm_output(store, s)(response_text="Warte.", **LOCAL)
+        return tools, store, s
+
+    def test_idle_follow_up_runs_in_a_row_pause_the_loop(self):
+        tools, store, _ = self.run_ends(5)
+        state = store.load(tools._load(LOCAL).chat_key)
+        self.assertEqual(state.goal("g1").status, "paused")
+        self.assertEqual(len(goal_loop._CTX.sent), 3)
+        self.assertIn("paused_idle", open(store._ledger_path(state.chat_key)).read())
+
+    def test_follow_up_runs_with_tool_calls_keep_going(self):
+        tools, store, _ = self.run_ends(5, tools_between=True)
+        state = store.load(tools._load(LOCAL).chat_key)
+        self.assertNotEqual(state.goal("g1").status, "paused")
+        self.assertEqual(len(goal_loop._CTX.sent), 5)
+
+    def test_an_owner_message_resets_the_idle_follow_up_count(self):
+        tools, store, s = self.run_ends(3)
+        owner(store, "Bitte mach weiter", settings=s)
+        state = store.load(tools._load(LOCAL).chat_key)
+        self.assertEqual(state.idle_resumes, 0)
+        self.assertEqual(state.tool_calls_at_resume, -1)
+
+
+class ContinuedLedgerTest(unittest.TestCase):
+    def test_every_continuation_writes_a_continued_event(self):
+        tools, store, _, s = setup()
+        set_and_go(tools, store)
+        stop(store, s, 0)
+        stop(store, s, 1)
+        key = tools._load({"session_id": "s1"}).chat_key
+        events = [l for l in open(store._ledger_path(key)) if '"continued"' in l]
+        self.assertEqual(len(events), 2)
+        self.assertIn('"attempt": 1', events[1])
 
 
 if __name__ == "__main__":

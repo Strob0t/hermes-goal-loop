@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any, Mapping, Optional
 
@@ -712,6 +713,9 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             return None
         state.nudge_seq += 1
         state.continuations = attempt + 1
+        # 0.4.2: every continuation is visible in the ledger (also after a stop turn).
+        store.append_ledger(state.chat_key, "continued", attempt=attempt,
+                            open=[g.id for g in open_goals])
         # L2: idle detection by tool calls since the last continuation.
         if state.tool_calls_at_nudge >= 0 and state.tool_calls == state.tool_calls_at_nudge:
             state.idle_nudges += 1
@@ -834,6 +838,24 @@ def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
     inject = getattr(_CTX, "inject_message", None)
     if (platform not in LOCAL_PLATFORMS or not settings.get("resume") or not limit
             or state.resumes >= limit or not callable(inject)):
+        return False
+    # 0.4.2: a follow-up run without a tool call is idle; idle_pause_after idle runs in a row
+    # pause the loop (only an owner message resets the count). A turn cut at the iteration
+    # limit has tool calls, so issue #1 is not affected.
+    if state.tool_calls_at_resume >= 0 and state.tool_calls == state.tool_calls_at_resume:
+        state.idle_resumes += 1
+    else:
+        state.idle_resumes = 0
+    state.tool_calls_at_resume = state.tool_calls
+    idle_pause = settings.get("idle_pause_after")
+    if idle_pause and state.idle_resumes >= idle_pause:
+        open_goals = state.open_goals()
+        gids = ", ".join(g.id for g in open_goals)
+        lang = _language(state, store, settings, state.chat_key)
+        _pause(store, state, open_goals, "follow-up runs in a row without a tool call",
+               _dtext(lang)["idle"].format(n=state.idle_resumes, gids=gids), state.chat_key,
+               "paused_idle")
+        store.save(state)
         return False
     from . import resume_run
     import secrets
@@ -1092,7 +1114,8 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                         state.tool_calls_at_nudge = -1
                         store.save(state)
                     if state.go and state.unfinished():
-                        return _goal_context(state, "[goal-loop] Goals of this chat (owner-approved; "
+                        return _goal_context(state, f"[goal-loop] Goals of this chat at {time.strftime('%H:%M')} "
+                                            "(owner-approved; a newer goal list wins; "
                                                     "do not change them without the owner):")
                 return None
             if not _is_owner_message(user_message, conversation_history):
@@ -1123,8 +1146,14 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 state.idle_nudges = 0
                 state.tool_calls_at_nudge = -1
                 store.save(state)
+            if state.idle_resumes or state.tool_calls_at_resume >= 0:
+                # 0.4.2: an owner message starts a new count of idle follow-up runs.
+                state.idle_resumes = 0
+                state.tool_calls_at_resume = -1
+                store.save(state)
             if state.go and state.unfinished() and text.lower().strip(" .!") not in words:
-                return _goal_context(state, "[goal-loop] Goals of this chat (owner-approved; "
+                return _goal_context(state, f"[goal-loop] Goals of this chat at {time.strftime('%H:%M')} "
+                                            "(owner-approved; a newer goal list wins; "
                                             "do not change them without the owner):")
         except Exception:
             logger.debug("goal-loop pre_llm_call failed", exc_info=True)
