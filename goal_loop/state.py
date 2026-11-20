@@ -25,8 +25,9 @@ loop).
 Small side files per **session id**: ``gate_<session>.json`` (the go gate: ``goal_set`` opens it with
 a count of 0, the ``pre_llm_call`` hook adds 1 for each owner message, ``goal_go`` needs at least 1),
 ``change_<session>.json`` (the same for a changed goal list after the go), ``sess_<session>.json``
-(the chat key of the session, for hooks that get only ``session_id``) and ``lang_<session>.json``
-(owner language votes).
+(the chat key of the session, for hooks that get only ``session_id``), ``lang_<session>.json``
+(owner language votes) and ``parent_<session>.json`` (E1 A: ``{"parent_session_id": ...}``, written by
+an importer such as owui-to-hermes; read only by the plugin).
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 STATE_VERSION = 3
 GOAL_STATUS = ("open", "in_work", "waiting", "paused", "blocked", "done")
@@ -118,6 +119,10 @@ class GoalState:
     language: str = ""
     resumes: int = 0
     last_model: str = ""
+    # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
+    # key that this state took the goals from.
+    adopted_by: str = ""
+    adopted_from: str = ""
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -146,6 +151,8 @@ class GoalState:
             language=str(data.get("language", "")),
             resumes=int(data.get("resumes", 0)),
             last_model=str(data.get("last_model", "")),
+            adopted_by=str(data.get("adopted_by", "")),
+            adopted_from=str(data.get("adopted_from", "")),
         )
 
     def goal(self, goal_id: str) -> Optional[Goal]:
@@ -178,9 +185,13 @@ class GoalStore:
     A terminal event is appended to the ledger BEFORE the state file is rewritten.
     """
 
-    def __init__(self, base_dir: str) -> None:
+    def __init__(self, base_dir: str, parent_of: Optional[Callable[[str], Optional[str]]] = None) -> None:
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
+        # E1 A: parent_of(session_id) -> the parent session id (state.db parent_session_id) or
+        # None. A chat without a state file takes over the goals of its nearest ancestor.
+        self.parent_of = parent_of
+        self._no_parent: set[str] = set()
 
     @staticmethod
     def _safe(chat_key: str) -> str:
@@ -197,13 +208,75 @@ class GoalStore:
 
     def load(self, chat_key: str) -> GoalState:
         path = self._state_path(chat_key)
-        if not os.path.exists(path):
+        if not os.path.exists(path) and not self.adopt_parent(chat_key):
             return GoalState(chat_key=chat_key)
         with open(path, encoding="utf-8") as handle:
             return GoalState.from_json(handle.read())
 
     def exists(self, chat_key: str) -> bool:
-        return os.path.exists(self._state_path(chat_key))
+        return os.path.exists(self._state_path(chat_key)) or self.adopt_parent(chat_key)
+
+    def _read_state(self, chat_key: str) -> Optional[GoalState]:
+        path = self._state_path(chat_key)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return GoalState.from_json(handle.read())
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def parent_session(self, session_id: str) -> Optional[str]:
+        """The parent of a session: state.db ``parent_session_id`` (``parent_of``), else the parent
+        note ``parent_<session>.json`` that an importer wrote (the Hermes import keeps a parent only
+        when it is imported history of the same owner, hermes_state_mutations._import)."""
+        parent = None
+        if self.parent_of is not None:
+            try:
+                parent = self.parent_of(session_id)
+            except Exception:
+                parent = None
+        if not parent:
+            note = self._read_side("parent", session_id) or {}
+            parent = note.get("parent_session_id")
+        return str(parent) if isinstance(parent, str) and parent else None
+
+    def adopt_parent(self, chat_key: str, max_hops: int = 8) -> bool:
+        """E1 A: a chat without a state file takes over the goals of its nearest ancestor session
+        (parent_session_id: an import, a branch, a continuation) that has goals and was not taken
+        over yet. The ancestor state is marked ``adopted_by`` and gets ``go`` False, so one chat
+        has one active goal state. Ledger: ``adopted_from`` in the new chat, ``adopted_by`` in the
+        old chat, before the state files are written. True when a state was taken over."""
+        if chat_key in self._no_parent or not chat_key.startswith("chat:"):
+            return False
+        current, seen = chat_key[len("chat:"):], {chat_key}
+        for _ in range(max_hops):
+            parent = self.parent_session(current)
+            if not parent:
+                break
+            current = str(parent)
+            keys = [k for k in (self.chat_for_session(current), "chat:" + current) if k and k not in seen]
+            for key in keys:
+                seen.add(key)
+                old = self._read_state(key)
+                if old is None or not old.goals or old.adopted_by:
+                    continue
+                if os.path.exists(self._state_path(chat_key)):
+                    return True
+                new = GoalState.from_json(old.to_json())
+                new.chat_key = chat_key
+                new.adopted_from = key
+                new.adopted_by = ""
+                self.append_ledger(chat_key, "adopted_from", from_chat=key, session=current,
+                                   goals=len(new.goals), go=new.go)
+                self.append_ledger(key, "adopted_by", by_chat=chat_key)
+                self.save(new)
+                old.adopted_by = chat_key
+                old.go = False
+                self.save(old)
+                return True
+        self._no_parent.add(chat_key)
+        return False
 
     @staticmethod
     def _write_atomic(path: str, text: str) -> None:

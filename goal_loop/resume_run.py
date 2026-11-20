@@ -19,11 +19,18 @@ PREFIX = "[goal-loop resume "
 KEY_FILES = ("/run/secrets/hermes_api_key",)
 STARTS = "/opt/data/gateway-starts.log"
 URL = os.environ.get("GOAL_LOOP_RESUME_URL", "http://127.0.0.1:8642/v1/chat/completions")
+# An Open WebUI chat (restart resume with owui_key) goes through hermes-models, so its session map
+# records the turn for the chat and the delivery binds the answer to that chat.
+OWUI_URL = os.environ.get("GOAL_LOOP_RESUME_OWUI_URL", "http://hermes-models:8080/v1/chat/completions")
 TIMEOUT = float(os.environ.get("GOAL_LOOP_RESUME_TIMEOUT", "3300"))
 OPEN = ("open", "in_work")
 TEXT = (PREFIX + "{nonce}] Follow-up run of the goal loop (no owner message). Continue the work on the "
         "open goals of this chat. Do not ask the owner for a go; record owner decisions with "
         "goal_decision.")
+RESTART_TEXT = (PREFIX + "{nonce}] Hermes restarted while your last turn in this chat was running; that "
+                "turn was cut off (no owner message now). Read the end of this chat, find the step that "
+                "was cut off and continue the owner's last request from there. Check the real state "
+                "before you repeat a step with side effects. Do not ask the owner for a go.")
 
 
 def _load(path):
@@ -61,6 +68,12 @@ def due(request, state, last_start):
     """The reason why the follow-up run must not post, or '' when it may post."""
     if not request or request.get("status") != "scheduled":
         return "no scheduled request"
+    if request.get("reason") == "restart":
+        # Made at plugin registration, a few seconds before the start line of the same process; a
+        # later start (another restart) makes a new request from the same running note.
+        if last_start > float(request.get("created", 0)) + 120:
+            return "Hermes started again after the request"
+        return ""  # a turn that the restart cut off resumes with or without goals
     if last_start > float(request.get("created", 0)):
         return "Hermes started again after the request"
     if not state or not state.get("go"):
@@ -71,11 +84,17 @@ def due(request, state, last_start):
 
 
 def post(request, key, opener=None):
+    restart = request.get("reason") == "restart"
+    text = (RESTART_TEXT if restart else TEXT).format(nonce=request["nonce"])
     body = {"model": request.get("model") or "hermes-agent", "stream": False,
-            "messages": [{"role": "user", "content": TEXT.format(nonce=request["nonce"])}]}
-    req = urllib.request.Request(URL, data=json.dumps(body).encode(), method="POST", headers={
-        "Authorization": "Bearer " + key, "Content-Type": "application/json",
-        "X-Hermes-Session-Id": request["session_id"]})
+            "messages": [{"role": "user", "content": text}]}
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json",
+               "X-Hermes-Session-Id": request["session_id"]}
+    url = URL
+    if restart and request.get("owui_key"):
+        url = OWUI_URL
+        headers["X-Hermes-Session-Key"] = request["owui_key"]
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
     open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
     for attempt in range(3):
         try:

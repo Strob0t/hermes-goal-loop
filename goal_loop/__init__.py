@@ -78,6 +78,9 @@ DEFAULTS = {
     "resume": True,
     "resume_delay": "1m",
     "resume_max": 20,
+    # r4: a turn that a Hermes restart cut off gets one continuation turn after the start.
+    "restart_resume": True,
+    "restart_resume_delay": "2m",
 }
 
 FINAL_REPORT_NUDGE = (
@@ -540,10 +543,15 @@ class _Tools:
                     "obstacle stays for several rounds, not because the work is hard. Try a different "
                     "way now; call goal_block again in a later round if the same obstacle stays. If "
                     "the owner must decide or give something, use goal_decision.")
+        # C1: a goal that the chat already showed as blocked for the same obstacle is not shown
+        # again; only a new reason shows it again.
+        shown_before = (goal.status == "blocked" and goal.block_shown
+                        and bool(goal.note) and _similar(goal.note, reason))
         goal.status = "blocked"
         goal.note = reason
-        goal.block_shown = False
-        self.store.append_ledger(state.chat_key, "blocked", goal_id=goal.id, reason=reason[:200])
+        goal.block_shown = shown_before
+        self.store.append_ledger(state.chat_key, "blocked", goal_id=goal.id, reason=reason[:200],
+                                 shown_again=not shown_before)
         self.store.save(state)
         return f"Goal {goal.id} marked blocked. The loop will not retry it."
 
@@ -815,6 +823,7 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
                    platform: str = "", conversation_id: str = "", **_: Any) -> Optional[str]:
         if platform in EXCLUDED_PLATFORMS:
             return None
+        _note_turn_end(store, session_id)
         body = response_text if isinstance(response_text, str) and response_text else text
         if not isinstance(body, str):
             return None
@@ -966,6 +975,59 @@ def _note_model(store: GoalStore, gate: str, model: Any) -> None:
         store.save(state)
 
 
+def _owui_key(session_id: str) -> str:
+    """The Open WebUI key ``owui:<user>:<chat>`` that Hermes bound to this API session (state_meta
+    ``gateway.api.conversation.v1.<key>`` = session id, gateway/session_api.py), or ''."""
+    import sqlite3
+    path = os.path.join(os.path.dirname(_state_dir()), "state.db")
+    if not session_id or not os.path.exists(path):
+        return ""
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = db.execute("SELECT key FROM state_meta WHERE key LIKE ? AND value = ? LIMIT 1",
+                             ("gateway.api.conversation.v1.owui:%", session_id)).fetchone()
+        finally:
+            db.close()
+    except Exception:
+        return ""
+    return row[0][len("gateway.api.conversation.v1."):] if row else ""
+
+
+def _note_turn_start(store: GoalStore, session_id: Any, platform: str, conversation_id: Any,
+                     model: str, settings: Settings) -> None:
+    """r4: a turn of this session is running (restart_resume.py)."""
+    if not settings.get("restart_resume"):
+        return
+    try:
+        from . import restart_resume
+        sid = str(session_id or "")
+        owui = _owui_key(sid) if platform == "api_server" else ""
+        restart_resume.note_start(store.base_dir, sid, platform, BOOT_ID,
+                                  chat_key=_gate_for(store, sid, conversation_id),
+                                  owui_key=owui, model=model)
+    except Exception:
+        logger.debug("goal-loop running note not written", exc_info=True)
+
+
+def _note_turn_end(store: GoalStore, session_id: Any) -> None:
+    try:
+        from . import restart_resume
+        restart_resume.note_end(store.base_dir, str(session_id or ""))
+    except Exception:
+        logger.debug("goal-loop running note not removed", exc_info=True)
+
+
+def resume_after_restart(store: GoalStore, settings: Settings) -> list:
+    """r4: one continuation turn for each turn that the last restart cut off."""
+    if not settings.get("restart_resume"):
+        return []
+    from . import restart_resume
+    return restart_resume.scan_and_schedule(
+        store.base_dir, BOOT_ID, store.append_ledger,
+        delay=str(settings.get("restart_resume_delay") or "2m"))
+
+
 def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
     """For each owner message: count it for the go and change gates, mark it for this process
     (L13), detect a stop word (L8) and the language (O2), and return the goal context (L4)."""
@@ -977,6 +1039,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             return None
         try:
             text = _message_text(user_message).strip()
+            _note_turn_start(store, session_id, platform, _.get("conversation_id"), model, settings)
             if _is_follow_up(store, session_id, _.get("conversation_id"), text):
                 # L15: a follow-up run of the plugin is never an owner message (no go, no
                 # change approval, no restart re-arm); it gets the goal context.
@@ -1079,9 +1142,30 @@ def prompt_section(session_info: Mapping[str, Any]) -> str:
     return USAGE_HINT
 
 
+def _parent_session(session_id: str) -> Optional[str]:
+    """E1 A: parent_session_id of a session in state.db (read only), or None. A compression edge
+    is no parent here: the conversation id of a compressed chat already stays the same."""
+    import sqlite3
+    if not session_id:
+        return None
+    path = os.path.join(os.path.dirname(_state_dir()), "state.db")
+    if not os.path.exists(path):
+        return None
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    try:
+        row = db.execute("SELECT s.parent_session_id, p.end_reason FROM sessions s "
+                         "LEFT JOIN sessions p ON p.id = s.parent_session_id WHERE s.id = ?",
+                         (session_id,)).fetchone()
+    finally:
+        db.close()
+    if not row or not row[0] or row[1] == "compression":
+        return None
+    return str(row[0])
+
+
 def register(ctx) -> None:
     """Register the goal tools, the hooks, the judge task and the usage hint."""
-    store = GoalStore(_state_dir())
+    store = GoalStore(_state_dir(), parent_of=_parent_session)
     settings = Settings(ctx)
     tools = _Tools(store, ctx, settings)
     register_task = getattr(ctx, "register_auxiliary_task", None)
@@ -1128,4 +1212,10 @@ def register(ctx) -> None:
             register_section(PROMPT_SECTION_ID, prompt_section)
         except Exception:
             logger.warning("goal-loop usage hint not registered", exc_info=True)
+    try:
+        jobs = resume_after_restart(store, settings)
+        if jobs:
+            logger.info("goal-loop: %d restart resume(s) scheduled: %s", len(jobs), ", ".join(jobs))
+    except Exception:
+        logger.warning("goal-loop restart resume scan failed", exc_info=True)
     logger.info("goal-loop plugin registered: 7 tools, 5 hooks, judge task, usage hint")

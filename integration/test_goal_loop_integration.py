@@ -163,7 +163,9 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         del os.environ["GOAL_LOOP_STATE_DIR"]
 
     def go(self, **ids):
-        owner_message(ids.get("session_id"))
+        # The fork (807f821+) hands pre_llm_call the conversation id: the owner message of a
+        # rotated session carries the conversation root, as in a real turn.
+        owner_message(ids.get("session_id"), conversation_root=ids.get("conversation_id"))
         return self.tools.goal_go({}, **ids)
 
     def test_follow_up_run_is_scheduled_through_the_real_transform_and_cron_parser(self):

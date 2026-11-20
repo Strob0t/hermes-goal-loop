@@ -158,8 +158,34 @@ Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_j
   | `resume` | true | follow-up runs (see **Follow-up runs**) |
   | `resume_delay` | 1m | delay of a follow-up run after the end of a run |
   | `resume_max` | 20 | follow-up runs per go; then pause + decision (0 = off) |
+  | `restart_resume` | true | a turn that a Hermes restart cut off gets one continuation turn (see **Restart resume**) |
+  | `restart_resume_delay` | 2m | delay of that continuation turn after the plugin loads |
 - `GOAL_LOOP_STATE_DIR` — directory for per-chat state and ledger files
   (default `$HERMES_HOME/goal-loop`).
+
+## Restart resume
+
+Hermes v0.23.2 resumes a turn that a restart cut off only on push platforms; an API server
+(Open WebUI) or local turn ends `interrupted` and is not run again. The plugin closes that gap:
+
+1. Each turn start (`pre_llm_call`) writes `running_<session>.json` (session id, platform, the
+   Open WebUI key `owui:<user>:<chat>` that Hermes bound to the session, model, pid and process
+   start time); the end of the turn (`transform_llm_output`) removes it.
+2. When the plugin loads, each note of another process that does not run any more is a cut-off
+   turn. The plugin claims it (atomic rename) and schedules one continuation turn through the
+   follow-up path (request `resume_restart_<session>.json`, reason `restart`). An Open WebUI chat
+   is resumed through hermes-models with `X-Hermes-Session-Key`, so the session map and the
+   delivery bind the answer to that chat; other sessions go to the local API server.
+3. The turn text starts with `[goal-loop resume <nonce>]` and asks the model to continue the
+   cut-off step; it is no owner message (no go). Notes older than 6 h are dropped. Ledger events:
+   `restart_resume_scheduled`, `restart_resume_dropped`, `restart_resume_not_scheduled`.
+
+## Parent session (goal adoption)
+
+A chat without its own goal state takes over the state of its nearest ancestor session with goals
+(`parent_session_id` in state.db, or the note `parent_<session>.json` that an importer writes, because
+the Hermes import keeps a parent only for imported history of the same owner). The old state gets
+`adopted_by` and `go: false`; both ledgers record the take-over (`adopted_from`, `adopted_by`).
 
 ## Follow-up runs
 

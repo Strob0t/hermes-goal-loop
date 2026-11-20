@@ -106,7 +106,8 @@ def mark(path: str, status: str) -> None:
 
 def schedule_resume(state_dir: str, chat_key: str, session_id: str, model: str, delay: str,
                     stale_after: float = 7200.0, create_job: Optional[Callable[..., dict]] = None,
-                    hermes_home: Optional[str] = None, now: Optional[float] = None) -> Optional[str]:
+                    hermes_home: Optional[str] = None, now: Optional[float] = None,
+                    extra: Optional[dict] = None) -> Optional[str]:
     """Make one follow-up run for the chat; returns the cron job id, or None when a request is
     still pending (not older than ``stale_after``) or the job cannot be made."""
     create_job = create_job or CREATE_JOB or _cron_create_job()
@@ -124,7 +125,9 @@ def schedule_resume(state_dir: str, chat_key: str, session_id: str, model: str, 
     os.makedirs(scripts, exist_ok=True)
     name = "goal-loop-resume-" + hashlib.sha256(chat_key.encode()).hexdigest()[:12] + ".py"
     wrapper = os.path.join(scripts, name)
-    text = WRAPPER.format(request=path, state=os.path.join(state_dir, _safe(chat_key) + ".json"),
+    # the goal state of the chat (a restart resume names it in extra["state_key"])
+    state_key = str((extra or {}).get("state_key") or chat_key)
+    text = WRAPPER.format(request=path, state=os.path.join(state_dir, _safe(state_key) + ".json"),
                           runner=RUNNER)
     current = None
     if os.path.exists(wrapper):
@@ -135,10 +138,11 @@ def schedule_resume(state_dir: str, chat_key: str, session_id: str, model: str, 
             handle.write(text)
         os.replace(wrapper + ".tmp", wrapper)
     request = {"chat_key": chat_key, "session_id": session_id, "model": model or "",
-               "nonce": secrets.token_hex(8), "created": now, "status": "scheduled"}
+               "nonce": secrets.token_hex(8), "created": now, "status": "scheduled", **(extra or {})}
     _write(path, request)
     try:
-        job = create_job(prompt=None, schedule=f"in {delay}", name="goal-loop follow-up run",
+        name_ = "goal-loop restart resume" if (extra or {}).get("reason") == "restart" else "goal-loop follow-up run"
+        job = create_job(prompt=None, schedule=f"in {delay}", name=name_,
                          repeat=1, deliver="local", script=name, no_agent=True)
     except Exception:
         logger.warning("goal-loop follow-up run: cron job not made", exc_info=True)
