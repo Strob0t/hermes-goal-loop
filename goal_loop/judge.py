@@ -16,17 +16,23 @@ itself (agent/plugin_llm.py ``_check_task``), so the old built-in key ``goal_jud
 Verdicts: ``VERDICT: done``, ``VERDICT: wait <reason>`` (the effect can be examined only later) or
 ``VERDICT: not-done <missing points>``. A judge that does not answer (timeout, launch or call error)
 gives the method ``unavailable``: the caller keeps the goal status and asks for the same claim again.
+0.4.3: the judge is tried again (attempts, time limit per attempt, backoff, shortened claim) before it
+goes ``unavailable``; an answer without a VERDICT line counts as no answer.
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("goal_loop.judge")
 
 JUDGE_TASK = "goal_loop_judge"
 DEFAULT_TIMEOUT = 300
+# 0.4.3: a retry sends a shortened claim (a long claim makes a slow judge slower).
+RETRY_EVIDENCE_CHARS = 6000
+MIN_ATTEMPT_SECONDS = 10
 
 # Toolsets a judge child may use. ``terminal`` lets the judge RUN the goal's check command,
 # ``file`` lets it read files; the judge prompt and the pre_tool_call guard forbid any mutation.
@@ -106,8 +112,56 @@ def judge_route() -> dict:
 
 def run_judge(ctx: Any, goal_text: str, check: str, evidence: str,
               *, parent_toolsets: Optional[set] = None, timeout: int = DEFAULT_TIMEOUT,
-              route: Optional[dict] = None) -> Verdict:
-    """Run the judge, preferring a read-only child agent and falling back to a tool-less LLM call.
+              route: Optional[dict] = None, attempts: int = 1, attempt_timeout: Optional[int] = None,
+              backoff: float = 0, on_retry: Optional[Callable[[int, str], None]] = None,
+              sleep: Callable[[float], None] = time.sleep) -> Verdict:
+    """Run the judge with up to ``attempts`` tries inside the total budget ``timeout`` seconds.
+
+    0.4.3: an attempt that gives no answer (``unavailable``: timeout, launch or call error) or no
+    ``VERDICT`` line is tried again after ``backoff * attempt`` seconds, with a shortened claim and a
+    time limit of ``attempt_timeout`` seconds for each attempt. After the last attempt the result is
+    ``unavailable`` (never a rejection), so the caller keeps the goal status and asks for the same
+    claim again. ``on_retry(attempt, reason)`` is called before each new attempt.
+    """
+    attempts = max(1, int(attempts or 1))
+    deadline = time.monotonic() + max(1, int(timeout or DEFAULT_TIMEOUT))
+    last = Verdict(False, "judge did not run", "unavailable")
+    for attempt in range(1, attempts + 1):
+        remaining = deadline - time.monotonic()
+        if attempt > 1 and remaining < MIN_ATTEMPT_SECONDS:
+            break
+        per = int(max(1, min(remaining, attempt_timeout or remaining)))
+        text = evidence if attempt == 1 or len(evidence) <= RETRY_EVIDENCE_CHARS else (
+            evidence[:RETRY_EVIDENCE_CHARS] + "\n[claim shortened for a retry]")
+        verdict = _judge_once(ctx, goal_text, check, text, parent_toolsets=parent_toolsets,
+                              timeout=per, route=route)
+        if not (verdict.unavailable or _no_verdict(verdict)):
+            return verdict
+        last = verdict
+        if attempt < attempts:
+            if on_retry is not None:
+                try:
+                    on_retry(attempt, verdict.reason)
+                except Exception:
+                    logger.debug("judge on_retry failed", exc_info=True)
+            pause = float(backoff or 0) * attempt
+            if pause > 0 and deadline - time.monotonic() > pause + MIN_ATTEMPT_SECONDS:
+                sleep(pause)
+    if last.unavailable:
+        return last
+    return Verdict(False, f"{last.reason} ({attempts} attempts)", "unavailable")
+
+
+def _no_verdict(verdict: Verdict) -> bool:
+    """The judge answered, but without a usable verdict line (0.4.3: counts as no answer)."""
+    return (not verdict.done and not verdict.wait
+            and verdict.reason in ("judge returned no verdict", "judge gave no VERDICT line"))
+
+
+def _judge_once(ctx: Any, goal_text: str, check: str, evidence: str,
+                *, parent_toolsets: Optional[set] = None, timeout: int = DEFAULT_TIMEOUT,
+                route: Optional[dict] = None) -> Verdict:
+    """One judge attempt: a read-only child agent, else a tool-less LLM call.
 
     ``subagent_lifecycle.launch`` clamps the requested toolsets to the parent's rights and raises
     if they would broaden them; then the ``ctx.llm`` path runs. A child that does not finish in

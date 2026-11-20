@@ -700,7 +700,10 @@ class Goal3JudgeTest(unittest.TestCase):
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         out = tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s",
                                "checks": [{"explanation": "e", "result": "passed"}]}}, **IDS)
-        self.assertIn("rejected", out)
+        # 0.4.3: an answer without a VERDICT line is tried again; after the last attempt the judge
+        # counts as unavailable (the goal is never confirmed, and no rejection is counted).
+        self.assertIn("Judge unavailable", out)
+        self.assertFalse(store.load(_chat_key("s1")).goal("g1").done)
 
 
 class Goal4DoneStaysDoneTest(unittest.TestCase):

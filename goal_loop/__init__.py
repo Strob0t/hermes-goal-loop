@@ -54,8 +54,39 @@ logger = logging.getLogger("goal_loop")
 _STATE_DIR_ENV = "GOAL_LOOP_STATE_DIR"
 _STATE_SUBDIR = "goal-loop"
 
+_judge_sleep = time.sleep  # a test replaces it (no real pause between judge attempts)
+
+
+def _process_boot_id() -> str:
+    """One id per PROCESS, not per module import (0.4.3, F-reload-hold).
+
+    A plugin reload imports this module again; an id made at import (uuid4) then changed and held
+    every chat with a go like after a restart. The id is a hash of the process id and the process
+    start time (``/proc/self/stat`` field 22), so a reload keeps it and a new process gets a new one.
+    Without ``/proc`` it uses the module-level cache of an earlier import, else a random id."""
+    import hashlib
+    import sys
+    cached = getattr(sys.modules.get("goal_loop_boot"), "ID", "") if "goal_loop_boot" in sys.modules else ""
+    pid = os.getpid()
+    start = ""
+    try:
+        with open("/proc/self/stat", encoding="ascii") as handle:
+            start = handle.read().rsplit(")", 1)[1].split()[19]
+    except Exception:
+        start = ""
+    if start:
+        return hashlib.sha256(f"{pid}:{start}".encode()).hexdigest()[:32]
+    if cached:
+        return str(cached)
+    import types
+    holder = types.ModuleType("goal_loop_boot")
+    holder.ID = uuid.uuid4().hex
+    sys.modules["goal_loop_boot"] = holder
+    return holder.ID
+
+
 # One id per process: a state that a different process drove is held after a restart (L13).
-BOOT_ID = uuid.uuid4().hex
+BOOT_ID = _process_boot_id()
 
 STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
 
@@ -71,6 +102,15 @@ DEFAULTS = {
     "reject_pause_after": 3,
     "block_min_rounds": 3,
     "judge_timeout": 300,
+    # 0.4.3: the judge is tried again before it counts as unavailable. judge_timeout is the total
+    # budget of all attempts; judge_attempt_timeout limits one attempt; judge_backoff is the pause
+    # before attempt n+1 (backoff * n seconds).
+    "judge_attempts": 3,
+    "judge_attempt_timeout": 120,
+    "judge_backoff": 5,
+    # 0.4.3: at plugin start a state with a go and open goals, without activity for this many days,
+    # is paused (0 = off).
+    "stale_days": 1,
     "language": "auto",
     "paused_hint": True,
     "stop_words": ["stopp", "stop", "halt", "pause", "pausiere", "abbrechen"],
@@ -219,8 +259,13 @@ DECISION_TEXT = {
         "owner_stop": "Der Loop ist auf deinen Wunsch pausiert. Mit 'go' geht es weiter.",
         "resume_line": ("Der Loop läuft in {delay} in einem Folge-Run weiter: {n} Ziel(e) offen "
                         "({gids}). Die Antwort erscheint in diesem Chat. Mit 'stopp' hältst du ihn an."),
+        "wait_line": ("Der Loop wartet ({why}): {n} Ziel(e) offen ({gids}). Er läuft weiter, "
+                      "sobald das Ergebnis da ist oder du antwortest."),
         "inject_line": ("Der Loop läuft gleich in diesem Chat weiter: {n} Ziel(e) offen ({gids}). "
                         "Mit 'stopp' hältst du ihn an."),
+        "stale": ("Der Loop war {days} Tage ohne Aktivität und ist pausiert (Ziele: {gids}). "
+                  "Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele ändern; C) die Ziele "
+                  "streichen. Empfehlung: B, wenn die Ziele veraltet sein können, sonst A."),
         "resume_max": ("Der Loop hat {n} Folge-Runs ohne Abschluss gemacht und ist pausiert "
                        "(Ziele: {gids}). Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele "
                        "ändern; C) die Ziele streichen. Empfehlung: A, wenn die Ziele Fortschritt zeigen."),
@@ -241,8 +286,13 @@ DECISION_TEXT = {
         "owner_stop": "The loop is paused as you asked. Answer 'go' to continue.",
         "resume_line": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open "
                         "({gids}). The answer appears in this chat. Write 'stop' to halt it."),
+        "wait_line": ("The loop waits ({why}): {n} goal(s) open ({gids}). It goes on when the result "
+                      "is there or when you answer."),
         "inject_line": ("The loop continues in this chat now: {n} goal(s) open ({gids}). "
                         "Write 'stop' to halt it."),
+        "stale": ("The loop had no activity for {days} days and is paused (goals: {gids}). "
+                  "Options: A) continue (answer 'go'); B) change the goals; C) remove the goals. "
+                  "Recommendation: B if the goals can be out of date, else A."),
         "resume_max": ("The loop made {n} follow-up runs without completion and is paused "
                        "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
                        "C) remove the goals. Recommendation: A if the goals show progress."),
@@ -591,9 +641,18 @@ class _Tools:
         conv = str(kwargs.get("conversation_id") or kwargs.get("session_id") or "")
         _JUDGE_PARENTS[conv] = str(kwargs.get("session_id") or "")
         try:
+            retry_key = state.chat_key
+
+            def _note_retry(attempt: int, reason: str) -> None:
+                self.store.append_ledger(retry_key, "judge_retry", goal_id=goal.id, attempt=attempt,
+                                         reason=str(reason)[:120])
             verdict = run_judge(self.ctx, goal.text, goal.check, evidence,
                                 parent_toolsets=kwargs.get("_parent_toolsets"),
-                                timeout=self.settings.get("judge_timeout"))
+                                timeout=self.settings.get("judge_timeout"),
+                                attempts=self.settings.get("judge_attempts"),
+                                attempt_timeout=self.settings.get("judge_attempt_timeout"),
+                                backoff=self.settings.get("judge_backoff"), on_retry=_note_retry,
+                                sleep=lambda seconds: _judge_sleep(seconds))
         finally:
             _JUDGE_PARENTS.pop(conv, None)
         state = self.store.load(state.chat_key)  # the judge run may take minutes
@@ -645,6 +704,90 @@ class _Tools:
             reply += " Fix each missing point, then claim again."
         self.store.save(state)
         return reply
+
+
+# --- Wait barriers (0.4.3): the loop does not push while Hermes work or the owner is awaited -------
+
+def _background_wait(session_id: str) -> bool:
+    """A background process of this session that reports at its end (notify_on_complete) or waits for
+    a watch pattern is still running (tools.process_registry). Fail-safe: any error gives False."""
+    if not session_id:
+        return False
+    try:
+        from tools.process_registry import process_registry
+        with process_registry._lock:
+            running = list(process_registry._running.values())
+        for proc in running:
+            if str(getattr(proc, "parent_session_id", "") or "") != str(session_id):
+                continue
+            if proc.exited or not (proc.notify_on_complete or proc.watch_patterns):
+                continue
+            if process_registry.is_session_waiting(proc.id):
+                return True
+    except Exception:
+        logger.debug("goal-loop background wait check failed", exc_info=True)
+    return False
+
+
+def _delegation_wait(session_id: str) -> bool:
+    """An asynchronous delegation of this session is still live (tools.async_delegation)."""
+    if not session_id:
+        return False
+    try:
+        from tools.async_delegation import _LIVE_STATES, _session_records
+        return bool(_session_records(_LIVE_STATES, "", "", str(session_id)))
+    except Exception:
+        logger.debug("goal-loop delegation wait check failed", exc_info=True)
+    return False
+
+
+def _builtin_goal_active(session_id: str) -> bool:
+    """Hermes' own /goal is active in this session: it drives the session, the plugin yields."""
+    if not session_id:
+        return False
+    try:
+        from hermes_cli.goals import load_goal
+        goal = load_goal(str(session_id))
+        return bool(goal is not None and getattr(goal, "status", "") == "active")
+    except Exception:
+        logger.debug("goal-loop builtin goal check failed", exc_info=True)
+    return False
+
+
+def _owner_wait(state: GoalState) -> bool:
+    """All open goals wait for the owner: every one got a goal_block in the latest round AND a
+    goal_decision was recorded since the last continuation (a bare goal_block is only a try)."""
+    open_goals = state.open_goals()
+    return (bool(open_goals) and len(state.decisions) > state.decisions_at_nudge
+            and all(g.block_tries >= 1 and g.block_seq == state.nudge_seq for g in open_goals))
+
+
+def _wait_reason(state: GoalState, session_id: str) -> str:
+    """Why the loop must not continue now, as a ledger event name; '' = continue."""
+    if _builtin_goal_active(session_id):
+        return "yield_builtin_goal"
+    if _background_wait(session_id):
+        return "waiting_background"
+    if _delegation_wait(session_id):
+        return "waiting_delegation"
+    if _owner_wait(state):
+        return "waiting_owner"
+    return ""
+
+
+_WAIT_TEXT = {
+    "yield_builtin_goal": ("Hermes' own /goal is active", "Hermes' eigenes /goal ist aktiv"),
+    "waiting_background": ("a background process is running", "ein Hintergrundprozess läuft"),
+    "waiting_delegation": ("a delegated task is running", "eine delegierte Aufgabe läuft"),
+    "waiting_owner": ("all open goals wait for your decision", "alle offenen Ziele warten auf deine Entscheidung"),
+}
+
+
+def _wait_note(store: GoalStore, state: GoalState, reason: str) -> None:
+    """One ledger line per change of the wait reason (not one per turn)."""
+    if state.wait_reason != reason:
+        state.wait_reason = reason
+        store.append_ledger(state.chat_key, reason, open=[g.id for g in state.open_goals()])
 
 
 # --- The pre_stop hook ------------------------------------------------------------------------
@@ -711,6 +854,16 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
         if not open_goals:
             store.save(state)
             return None
+        # 0.4.3: no push while Hermes work or the owner is awaited (the end of that work, or an owner
+        # message, starts the next turn, and this hook runs again then).
+        why = _wait_reason(state, session_id)
+        if why:
+            _wait_note(store, state, why)
+            store.save(state)
+            return None
+        if state.wait_reason:
+            state.wait_reason = ""
+        state.decisions_at_nudge = len(state.decisions)
         state.nudge_seq += 1
         state.continuations = attempt + 1
         # 0.4.2: every continuation is visible in the ledger (also after a stop turn).
@@ -829,7 +982,7 @@ LOCAL_PLATFORMS = ("local", "cli", "tui", "desktop")
 
 
 def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
-                      platform: str) -> bool:
+                      platform: str, session_id: str = "") -> bool:
     """Issue #1: one follow-up turn of a local (CLI, TUI) session after the go while goals are
     open, through PluginContext.inject_message: Hermes commits it to the durable FIFO of the
     session the hook runs for (gateway/plugin_keyless_inject.py; a person's input goes first). It
@@ -838,6 +991,8 @@ def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
     inject = getattr(_CTX, "inject_message", None)
     if (platform not in LOCAL_PLATFORMS or not settings.get("resume") or not limit
             or state.resumes >= limit or not callable(inject)):
+        return False
+    if _wait_reason(state, session_id):  # 0.4.3: handled in _transform (wait line), no follow-up
         return False
     # 0.4.2: a follow-up run without a tool call is idle; idle_pause_after idle runs in a row
     # pause the loop (only an owner message resets the count). A turn cut at the iteration
@@ -905,12 +1060,18 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
         held = bool(state.boot_id) and state.boot_id != BOOT_ID
         open_goals = state.open_goals() if state.go and not held else []
         tail = ""
-        if open_goals and platform == "api_server" and _schedule_follow_up(store, state, settings,
-                                                                          session_id):
+        why = _wait_reason(state, session_id) if open_goals else ""
+        if why:
+            _wait_note(store, state, why)
+            tail = "\n\n" + _dtext(lang)["wait_line"].format(
+                why=_WAIT_TEXT[why][1 if lang == "de" else 0], n=len(open_goals),
+                gids=", ".join(g.id for g in open_goals))
+        elif open_goals and platform == "api_server" and _schedule_follow_up(store, state, settings,
+                                                                            session_id):
             tail = "\n\n" + _dtext(lang)["resume_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals),
                 delay=settings.get("resume_delay"))
-        elif open_goals and _inject_follow_up(store, state, settings, platform):
+        elif open_goals and _inject_follow_up(store, state, settings, platform, session_id):
             # Issue #1: a local chat (also after a turn cut at the iteration limit) continues.
             tail = "\n\n" + _dtext(lang)["inject_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals))
@@ -1146,6 +1307,13 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 state.idle_nudges = 0
                 state.tool_calls_at_nudge = -1
                 store.save(state)
+            if state.wait_reason or any(g.block_seq >= 0 for g in state.goals):
+                # 0.4.3: an owner message lifts every wait (the owner answered).
+                state.wait_reason = ""
+                state.decisions_at_nudge = len(state.decisions)
+                for g in state.goals:
+                    g.block_seq = -1
+                store.save(state)
             if state.idle_resumes or state.tool_calls_at_resume >= 0:
                 # 0.4.2: an owner message starts a new count of idle follow-up runs.
                 state.idle_resumes = 0
@@ -1242,6 +1410,47 @@ def _parent_session(session_id: str) -> Optional[str]:
     return str(row[0])
 
 
+def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float] = None) -> list:
+    """0.4.3 (decision 6B): a state with a go and open goals whose file has not changed for
+    ``stale_days`` days is paused (go False, open goals paused, ledger ``paused_stale``, one decision).
+    Nothing is deleted; a new go of the owner continues it. Returns the paused chat keys."""
+    days = settings.get("stale_days")
+    if not days:
+        return []
+    now = time.time() if now is None else now
+    limit = days * 86400
+    paused = []
+    for name in sorted(os.listdir(store.base_dir)):
+        if not (name.startswith("chat_") and name.endswith(".json")):
+            continue
+        path = os.path.join(store.base_dir, name)
+        try:
+            if now - os.path.getmtime(path) < limit:
+                continue
+            with open(path, encoding="utf-8") as handle:
+                state = GoalState.from_json(handle.read())
+        except Exception:
+            continue
+        open_goals = state.open_goals()
+        if not state.go or not open_goals:
+            continue
+        lang = _language(state, store, settings, state.chat_key)
+        gids = ", ".join(g.id for g in open_goals)
+        age = int((now - os.path.getmtime(path)) // 86400)
+        store.append_ledger(state.chat_key, "paused_stale", goal_ids=[g.id for g in open_goals],
+                            days=age)
+        for goal in open_goals:
+            goal.status = "paused"
+            goal.note = f"no activity for {age} days"
+            goal.block_shown = False
+        state.decisions.append(_dtext(lang)["stale"].format(days=age, gids=gids))
+        state.go = False
+        store.save(state)
+        store.open_gate(state.chat_key)  # the next owner message counts for a new go
+        paused.append(state.chat_key)
+    return paused
+
+
 def register(ctx) -> None:
     """Register the goal tools, the hooks, the judge task and the usage hint."""
     global _CTX
@@ -1293,6 +1502,12 @@ def register(ctx) -> None:
             register_section(PROMPT_SECTION_ID, prompt_section)
         except Exception:
             logger.warning("goal-loop usage hint not registered", exc_info=True)
+    try:
+        paused = pause_stale_states(store, settings)
+        if paused:
+            logger.info("goal-loop: %d stale state(s) paused: %s", len(paused), ", ".join(paused))
+    except Exception:
+        logger.warning("goal-loop stale pause failed", exc_info=True)
     try:
         jobs = resume_after_restart(store, settings)
         if jobs:

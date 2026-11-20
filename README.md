@@ -151,7 +151,11 @@ Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_j
   | `reject_replan_after` | 2 | similar judge rejections before a request to plan again |
   | `reject_pause_after` | 3 | similar judge rejections before a pause + decision (0 = off) |
   | `block_min_rounds` | 3 | rounds with the same obstacle before `goal_block` is accepted |
-  | `judge_timeout` | 300 | seconds the judge child may run; a timeout keeps the goal status |
+  | `judge_timeout` | 300 | total seconds of all judge attempts; a judge without an answer keeps the goal status |
+  | `judge_attempts` | 3 | judge attempts before `judge_unavailable` (0.4.3); an answer without a VERDICT line counts as no answer |
+  | `judge_attempt_timeout` | 120 | seconds of one judge attempt; a retry gets a shortened claim |
+  | `judge_backoff` | 5 | pause before attempt n+1 (`judge_backoff * n` seconds); ledger `judge_retry` |
+  | `stale_days` | 1 | at plugin start a state with a go and open goals without activity for this many days is paused (`paused_stale`, one decision; 0 = off) |
   | `language` | `auto` | `auto` (from the owner messages), `de` or `en` for the plugin labels |
   | `paused_hint` | true | one line when a turn ends with open goals after the go and no follow-up run is scheduled |
   | `stop_words` | stopp, stop, halt, pause, pausiere, abbrechen | an owner message that is one of these pauses the loop |
@@ -198,6 +202,28 @@ runs, not after `resume_max`. Each `pre_stop` continuation writes the ledger eve
 (`attempt`, open goal ids). The goal context of `pre_llm_call` carries its time ("Goals of this chat at
 HH:MM"): Hermes stores this context with the owner message and sends it again in later turns, so an
 old copy is visible as old.
+
+## Wait barriers (0.4.3)
+
+The loop does not push while other work or the owner is awaited. `pre_stop`, the local follow-up turn and
+the cron follow-up run are skipped when (checked in this order, ledger event once per change):
+
+- `yield_builtin_goal`: Hermes' own `/goal` is active in the session (`hermes_cli.goals.load_goal`); it
+  drives the session.
+- `waiting_background`: a background process of the session with `notify_on_complete` or watch patterns
+  runs (`tools.process_registry`); its result starts the next turn.
+- `waiting_delegation`: an asynchronous delegation of the session is live (`tools.async_delegation`).
+- `waiting_owner`: every open goal got a `goal_block` in the latest round and a `goal_decision` was
+  recorded since the last continuation.
+
+The answer then ends with one wait line. An owner message lifts every wait. A missing Hermes module
+counts as "no wait" (the loop is not stopped by an import error).
+
+## Boot id (0.4.3)
+
+The id that marks the process (restart detection, `restart_hold`) is a hash of the process id and the
+process start time, not a random id at import. A plugin reload keeps it, so a reload does not hold
+chats with a go any more.
 
 ## Parent session (goal adoption)
 

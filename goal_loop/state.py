@@ -122,6 +122,8 @@ class GoalState:
     # owner message resets it, so a chat that waits only for the owner pauses after a few runs.
     tool_calls_at_resume: int = -1
     idle_resumes: int = 0
+    wait_reason: str = ""
+    decisions_at_nudge: int = 0
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.
@@ -156,6 +158,8 @@ class GoalState:
             resumes=int(data.get("resumes", 0)),
             tool_calls_at_resume=int(data.get("tool_calls_at_resume", -1)),
             idle_resumes=int(data.get("idle_resumes", 0)),
+            wait_reason=str(data.get("wait_reason", "")),
+            decisions_at_nudge=int(data.get("decisions_at_nudge", 0)),
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),

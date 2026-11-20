@@ -7,3 +7,6 @@ from goal_loop import resume
 
 resume.CREATE_JOB = lambda **kwargs: {}
 resume.HERMES_HOME = tempfile.mkdtemp(prefix="gl-home-")
+
+import goal_loop as _goal_loop  # noqa: E402
+_goal_loop._judge_sleep = lambda seconds: None  # 0.4.3: no real pause between judge attempts in tests
