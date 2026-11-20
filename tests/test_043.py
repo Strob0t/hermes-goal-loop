@@ -233,6 +233,19 @@ class StalePauseTest(unittest.TestCase):
         self.assertEqual(ledger_events(store)[-1], "paused_stale")
         self.assertTrue(state.decisions)
 
+    def test_an_old_state_with_only_blocked_goals_is_paused(self):
+        tools, store, _, s = setup(stale_days=3)
+        set_and_go(tools, store)
+        state = store.load(_chat_key("s1"))
+        state.goal("g1").status = "blocked"
+        store.save(state)
+        old = time.time() - 4 * 86400
+        os.utime(store._state_path(_chat_key("s1")), (old, old))
+        self.assertEqual(pause_stale_states(store, s), [_chat_key("s1")])
+        state = store.load(_chat_key("s1"))
+        self.assertFalse(state.go)
+        self.assertEqual(state.goal("g1").status, "paused")
+
     def test_a_fresh_state_stays(self):
         tools, store, s = self._make(1)
         self.assertEqual(pause_stale_states(store, s), [])

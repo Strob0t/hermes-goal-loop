@@ -1411,7 +1411,7 @@ def _parent_session(session_id: str) -> Optional[str]:
 
 
 def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float] = None) -> list:
-    """0.4.3 (decision 6B): a state with a go and open goals whose file has not changed for
+    """0.4.3 (decision 6B): a state with a go and unfinished goals (also blocked ones) whose file has not changed for
     ``stale_days`` days is paused (go False, open goals paused, ledger ``paused_stale``, one decision).
     Nothing is deleted; a new go of the owner continues it. Returns the paused chat keys."""
     days = settings.get("stale_days")
@@ -1431,7 +1431,8 @@ def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float
                 state = GoalState.from_json(handle.read())
         except Exception:
             continue
-        open_goals = state.open_goals()
+        # every unfinished goal counts, also a blocked or paused one: the state still has a go
+        open_goals = [g for g in state.unfinished() if g.status != "cancelled"]
         if not state.go or not open_goals:
             continue
         lang = _language(state, store, settings, state.chat_key)
