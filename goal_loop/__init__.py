@@ -218,6 +218,8 @@ DECISION_TEXT = {
         "owner_stop": "Der Loop ist auf deinen Wunsch pausiert. Mit 'go' geht es weiter.",
         "resume_line": ("Der Loop läuft in {delay} in einem Folge-Run weiter: {n} Ziel(e) offen "
                         "({gids}). Die Antwort erscheint in diesem Chat. Mit 'stopp' hältst du ihn an."),
+        "inject_line": ("Der Loop läuft gleich in diesem Chat weiter: {n} Ziel(e) offen ({gids}). "
+                        "Mit 'stopp' hältst du ihn an."),
         "resume_max": ("Der Loop hat {n} Folge-Runs ohne Abschluss gemacht und ist pausiert "
                        "(Ziele: {gids}). Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele "
                        "ändern; C) die Ziele streichen. Empfehlung: A, wenn die Ziele Fortschritt zeigen."),
@@ -238,6 +240,8 @@ DECISION_TEXT = {
         "owner_stop": "The loop is paused as you asked. Answer 'go' to continue.",
         "resume_line": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open "
                         "({gids}). The answer appears in this chat. Write 'stop' to halt it."),
+        "inject_line": ("The loop continues in this chat now: {n} goal(s) open ({gids}). "
+                        "Write 'stop' to halt it."),
         "resume_max": ("The loop made {n} follow-up runs without completion and is paused "
                        "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
                        "C) remove the goals. Recommendation: A if the goals show progress."),
@@ -815,6 +819,38 @@ def _schedule_follow_up(store: GoalStore, state: GoalState, settings: Settings,
     return True
 
 
+# Issue #1: the PluginContext, for inject_message (a follow-up turn of a local session).
+_CTX: Any = None
+LOCAL_PLATFORMS = ("local", "cli", "tui", "desktop")
+
+
+def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
+                      platform: str) -> bool:
+    """Issue #1: one follow-up turn of a local (CLI, TUI) session after the go while goals are
+    open, through PluginContext.inject_message: Hermes commits it to the durable FIFO of the
+    session the hook runs for (gateway/plugin_keyless_inject.py; a person's input goes first). It
+    needs plugins.entries.goal-loop.allow_gateway_injection: true; False when refused."""
+    limit = settings.get("resume_max")
+    inject = getattr(_CTX, "inject_message", None)
+    if (platform not in LOCAL_PLATFORMS or not settings.get("resume") or not limit
+            or state.resumes >= limit or not callable(inject)):
+        return False
+    from . import resume_run
+    import secrets
+    nonce = secrets.token_hex(8)
+    try:
+        ok = bool(inject(resume_run.TEXT.format(nonce=nonce)))
+    except Exception:
+        logger.debug("goal-loop follow-up inject failed", exc_info=True)
+        ok = False
+    if not ok:
+        store.append_ledger(state.chat_key, "resume_inject_refused")
+        return False
+    state.resumes += 1
+    store.append_ledger(state.chat_key, "resume_injected", n=state.resumes, nonce=nonce)
+    return True
+
+
 def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = None):
     """Append the goal display to the final answer of a turn, only when there is news."""
     settings = settings or Settings()
@@ -852,6 +888,10 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             tail = "\n\n" + _dtext(lang)["resume_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals),
                 delay=settings.get("resume_delay"))
+        elif open_goals and _inject_follow_up(store, state, settings, platform):
+            # Issue #1: a local chat (also after a turn cut at the iteration limit) continues.
+            tail = "\n\n" + _dtext(lang)["inject_line"].format(
+                n=len(open_goals), gids=", ".join(g.id for g in open_goals))
         elif open_goals and settings.get("paused_hint"):
             tail = "\n\n" + _dtext(lang)["paused_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals))
@@ -1047,6 +1087,10 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 _take_request(store, key, text)
                 if store.exists(key):
                     state = store.load(key)
+                    if state.idle_nudges or state.tool_calls_at_nudge >= 0:
+                        state.idle_nudges = 0
+                        state.tool_calls_at_nudge = -1
+                        store.save(state)
                     if state.go and state.unfinished():
                         return _goal_context(state, "[goal-loop] Goals of this chat (owner-approved; "
                                                     "do not change them without the owner):")
@@ -1073,6 +1117,12 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             if not store.exists(key):
                 return None
             state = store.load(key)
+            if state.idle_nudges or state.tool_calls_at_nudge >= 0:
+                # Issue #1: an owner message starts a new round; idle turns of an earlier turn
+                # (for example one cut at the iteration limit) do not count into this one.
+                state.idle_nudges = 0
+                state.tool_calls_at_nudge = -1
+                store.save(state)
             if state.go and state.unfinished() and text.lower().strip(" .!") not in words:
                 return _goal_context(state, "[goal-loop] Goals of this chat (owner-approved; "
                                             "do not change them without the owner):")
@@ -1165,6 +1215,8 @@ def _parent_session(session_id: str) -> Optional[str]:
 
 def register(ctx) -> None:
     """Register the goal tools, the hooks, the judge task and the usage hint."""
+    global _CTX
+    _CTX = ctx
     store = GoalStore(_state_dir(), parent_of=_parent_session)
     settings = Settings(ctx)
     tools = _Tools(store, ctx, settings)

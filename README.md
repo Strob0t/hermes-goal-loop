@@ -180,6 +180,17 @@ Hermes v0.23.2 resumes a turn that a restart cut off only on push platforms; an 
    cut-off step; it is no owner message (no go). Notes older than 6 h are dropped. Ledger events:
    `restart_resume_scheduled`, `restart_resume_dropped`, `restart_resume_not_scheduled`.
 
+## Turn limit (issue #1)
+
+A turn can end at `agent.max_turns` while goals are open after the go; `pre_stop` does not run on that
+path. The end of the turn (`transform_llm_output`) still runs, so the loop goes on from there:
+`api_server` chats get the cron follow-up run (**Follow-up runs**); local chats (CLI, TUI, desktop) get
+one follow-up turn through `PluginContext.inject_message`, which Hermes commits to the durable FIFO of
+the session (an owner message goes first). This needs `plugins.entries.goal-loop.allow_gateway_injection:
+true`; without it the ledger has `resume_inject_refused` and the answer ends with the paused line. A
+follow-up turn and an owner message start a new idle count, so a cut at the limit is no idle round.
+Limits: `resume_max`, `budget_per_goal`, the stop word.
+
 ## Parent session (goal adoption)
 
 A chat without its own goal state takes over the state of its nearest ancestor session with goals
