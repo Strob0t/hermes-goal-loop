@@ -1,5 +1,9 @@
 """hermes-goal-loop — a goal loop for Hermes as a plugin (v0.3).
 
+0.4.5 (r32): the stop-cause line of an answer (done, owner-question, blocker) holds the loop until
+the next owner message; an owner question does not lift an open owner decision (only go, an answer
+that names an option, or a message without a question mark does).
+
 1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check. The
    plugin appends the goal list and the go question to the answer of that turn (one time; the model
    does not repeat the list). No loop runs before ``goal_go``. **Go rule:** ``goal_go`` is accepted
@@ -90,6 +94,45 @@ def _process_boot_id() -> str:
 BOOT_ID = _process_boot_id()
 
 STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
+# 0.4.5 (r32): an answer whose stop-cause line names one of these causes ends the loop until the next
+# owner message; "no-statement" lets the loop go on.
+HOLD_CAUSES = ("done", "owner-question", "blocker")
+# 0.4.5 (r32): an owner message that is one of these words answers an open owner decision (the loop
+# goes on); any other owner message (a question) keeps the decision wait.
+GO_WORDS = ("go", "weiter", "continue", "los")
+_STOP_CAUSE_LINE = re.compile(
+    r"^\W*(?:stopp?[- ]?grund|stop[- ]?cause)\W*:\W*(%s)\b" % "|".join(re.escape(c) for c in STOP_CAUSES),
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _stop_cause(text: Any) -> str:
+    """The cause of the last stop-cause line in the last 12 lines of an answer, or ''."""
+    if not isinstance(text, str) or not text:
+        return ""
+    found = _STOP_CAUSE_LINE.findall("\n".join(text.strip().splitlines()[-12:]))
+    return found[-1].lower() if found else ""
+
+
+# An option answer: "A", "4a", "r4b A", "2A", or the words "Empfehlung"/"recommendation"/"ok".
+_ANSWER_TOKEN = re.compile(r"(?<![\w])(?:\d{1,2}[a-dA-D]|[A-D]|ok|okay|empfehlung|recommendation|"
+                           r"einverstanden|agreed|ja|yes)(?![\w])", re.IGNORECASE)
+_ANSWER_TOKEN_CASED = re.compile(r"(?<![\w])(?:\d{1,2}[a-dA-D]|[A-D])(?![\w])")
+
+
+def _answers_decision(text: str) -> bool:
+    """0.4.5 (r32): True when an owner message answers an open decision; False for a question.
+    A go word, or a message without '?', is an answer; a message with '?' is an answer only when it
+    also names an option (e.g. '4a', 'A', 'Empfehlung', 'ok')."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.lower().strip(" .!") in GO_WORDS:
+        return True
+    if "?" not in t:
+        return True
+    words = _ANSWER_TOKEN.findall(t)
+    return any(w.lower() in ("ok", "okay", "empfehlung", "recommendation", "einverstanden", "agreed")
+               for w in words) or bool(_ANSWER_TOKEN_CASED.search(t))
 
 # ``cron`` is the owner rule (no loop in scheduled runs). ``subagent``: a delegated child (the judge)
 # inherits the parent's conversation_id, so the loop must not drive it (F7).
@@ -522,6 +565,8 @@ class _Tools:
             kept = {g.id for g in goals}
             goals.extend(g for g in state.goals if g.done and g.id not in kept)
         state.goals = goals
+        if change:
+            _lift_decision_wait(self.store, state, "change_approved")  # 0.4.5 (r32)
         state.continuations = 0
         state.list_changed = True
         state.final_shown = False
@@ -564,6 +609,7 @@ class _Tools:
         state.idle_nudges = 0
         state.tool_calls_at_nudge = -1
         state.decisions_at_nudge = len(state.decisions)  # 0.4.3: base of the owner wait
+        _lift_decision_wait(self.store, state, "go")  # 0.4.5 (r32)
         state.boot_id = BOOT_ID
         self.store.append_ledger(state.chat_key, "go", owner_messages=count,
                                  resumed=[g.id for g in paused])
@@ -781,9 +827,39 @@ def _wait_reason(state: GoalState, session_id: str) -> str:
         return "waiting_background"
     if _delegation_wait(session_id):
         return "waiting_delegation"
+    if state.stop_hold:
+        return "waiting_stop_cause"
+    if state.decision_wait:
+        return "waiting_decision"
     if _owner_wait(state):
         return "waiting_owner"
     return ""
+
+
+def _note_stop_cause(store: GoalStore, state: GoalState, text: Any) -> str:
+    """0.4.5 (r32): read the stop-cause line of a final answer. A hold cause holds the loop until
+    the next owner message; owner-question or blocker with a decision since the last owner answer
+    also opens the decision wait (a later owner question does not lift it, only go or an answer)."""
+    cause = _stop_cause(text)
+    if cause not in HOLD_CAUSES or not state.open_goals():
+        return cause
+    if state.stop_hold != cause:
+        state.stop_hold = cause
+        store.append_ledger(state.chat_key, "stop_cause_hold", cause=cause,
+                            open=[g.id for g in state.open_goals()])
+    if (cause in ("owner-question", "blocker") and len(state.decisions) > state.decisions_at_nudge
+            and not state.decision_wait):
+        state.decision_wait = True
+        store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
+    return cause
+
+
+def _lift_decision_wait(store: GoalStore, state: GoalState, why: str) -> None:
+    if state.decision_wait or state.stop_hold:
+        store.append_ledger(state.chat_key, "decision_wait_lifted", why=why)
+    state.decision_wait = False
+    state.stop_hold = ""
+    state.decisions_at_nudge = len(state.decisions)
 
 
 _WAIT_TEXT = {
@@ -791,6 +867,9 @@ _WAIT_TEXT = {
     "waiting_background": ("a background process is running", "ein Hintergrundprozess läuft"),
     "waiting_delegation": ("a delegated task is running", "eine delegierte Aufgabe läuft"),
     "waiting_owner": ("all open goals wait for your decision", "alle offenen Ziele warten auf deine Entscheidung"),
+    "waiting_stop_cause": ("the answer ended with a stop cause for you", "die Antwort endete mit einem Stopp-Grund für dich"),
+    "waiting_decision": ("an open decision waits for your answer or 'go'; a question does not restart it",
+                         "eine offene Entscheidung wartet auf deine Antwort oder 'go'; eine Rückfrage startet ihn nicht"),
 }
 
 
@@ -865,9 +944,15 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
         if not open_goals:
             store.save(state)
             return None
+        # 0.4.5 (r32): the stop-cause line of this answer.
+        _note_stop_cause(store, state, final_response)
         # 0.4.3: no push while Hermes work or the owner is awaited (the end of that work, or an owner
         # message, starts the next turn, and this hook runs again then).
         why = _wait_reason(state, session_id)
+        if why == "waiting_owner" and not state.decision_wait:
+            # 0.4.5 (r32): from now on an owner question does not lift this wait.
+            state.decision_wait = True
+            store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
         if why:
             _wait_note(store, state, why)
             store.save(state)
@@ -1070,7 +1155,12 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
         held = bool(state.boot_id) and state.boot_id != BOOT_ID
         open_goals = state.open_goals() if state.go and not held else []
         tail = ""
+        if open_goals:
+            _note_stop_cause(store, state, body)  # 0.4.5 (r32): also when pre_stop did not run
         why = _wait_reason(state, session_id) if open_goals else ""
+        if why == "waiting_owner" and not state.decision_wait:
+            state.decision_wait = True  # 0.4.5 (r32)
+            store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
         if why:
             _wait_note(store, state, why)
             tail = "\n\n" + _dtext(lang)["wait_line"].format(
@@ -1319,12 +1409,21 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 state.idle_nudges = 0
                 state.tool_calls_at_nudge = -1
                 store.save(state)
-            if state.wait_reason or any(g.block_seq >= 0 for g in state.goals):
+            if state.wait_reason or any(g.block_seq >= 0 for g in state.goals) or state.stop_hold:
                 # 0.4.3: an owner message lifts every wait (the owner answered).
+                # 0.4.5 (r32): except the decision wait, when the message is a question.
                 state.wait_reason = ""
-                state.decisions_at_nudge = len(state.decisions)
+                state.stop_hold = ""
+                if not state.decision_wait:
+                    state.decisions_at_nudge = len(state.decisions)
                 for g in state.goals:
                     g.block_seq = -1
+                store.save(state)
+            if state.decision_wait:
+                if _answers_decision(text):
+                    _lift_decision_wait(store, state, "owner_answer")
+                else:
+                    store.append_ledger(state.chat_key, "owner_question_kept_wait")
                 store.save(state)
             if state.idle_resumes or state.tool_calls_at_resume >= 0:
                 # 0.4.2: an owner message starts a new count of idle follow-up runs.

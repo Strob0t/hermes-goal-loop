@@ -124,6 +124,10 @@ class GoalState:
     idle_resumes: int = 0
     wait_reason: str = ""
     decisions_at_nudge: int = 0  # decisions at the last owner message or go (owner-wait base)
+    # 0.4.5 (r32): the stop cause of the last answer that holds the loop until the next owner message,
+    # and the decision wait that only go or an answer to the decision lifts (not an owner question).
+    stop_hold: str = ""
+    decision_wait: bool = False
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.
@@ -160,6 +164,8 @@ class GoalState:
             idle_resumes=int(data.get("idle_resumes", 0)),
             wait_reason=str(data.get("wait_reason", "")),
             decisions_at_nudge=int(data.get("decisions_at_nudge", 0)),
+            stop_hold=str(data.get("stop_hold", "")),
+            decision_wait=bool(data.get("decision_wait", False)),
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),
