@@ -143,7 +143,10 @@ class RestartLineTest(unittest.TestCase):
 
 class BackgroundWatchdogTest(unittest.TestCase):
     def _waiting(self, platform="local", **settings):
-        tools, store, s = ready(**settings)
+        # 0.4.9 (z11): these 0.4.7 cases test the watchdog without the end grace; the owner turn of the
+        # setup has ended (transform_llm_output clears its turn mark in a real turn).
+        tools, store, s = ready(**{"background_end_grace": 0, **settings})
+        goal_loop._turn_marks().clear()
         patch, proc, registry = bg_modules(running=True)
         with patch:
             self.assertIsNone(make_pre_stop(store, s)(session_id="s1", platform=platform, attempt=0,

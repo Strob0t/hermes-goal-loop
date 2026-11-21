@@ -1,5 +1,8 @@
 """hermes-goal-loop — a goal loop for Hermes as a plugin (v0.3).
 
+0.4.9: the background watchdog does not continue while a turn of the session runs (a turn mark older
+than turn_active_max does not count) and waits background_end_grace seconds after the first tick that
+sees all awaited processes ended; '8. A', '8: A', '8 - A' close decision 8, also with a '?' in the message.
 0.4.8: an owner message closes decisions only on a number with an option, a go word or explicit consent;
 the goal block shows the numbers it closed.
 0.4.7: an owner answer closes decisions by number ('5A' closes decision 5; 'go' or an answer without a
@@ -129,7 +132,8 @@ _ANSWER_START_CASED = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-
 
 
 # 0.4.7 (z3): a decision number with an option letter: '5A', '2b', '4 C' (not 'r4b', not 'z4 C').
-_DECISION_NUMBER = re.compile(r"(?<![\w.])(\d{1,2})\s?[a-dA-D](?![\w])")
+# 0.4.9 (z11): also with a separator: '8. A', '8: A', '8 - A', '8) A' (not '0.4.8 A', not '20:15 A').
+_DECISION_NUMBER = re.compile(r"(?<![\w.:])(\d{1,2})\s*(?:[.:)\-–]\s*)?[a-dA-D](?![\w])")
 # 0.4.8 (z10): explicit consent closes all open decisions ('Empfehlung', 'ok', 'alle Empfehlungen', ...).
 _CONSENT = re.compile(r"^\s*(?:(?:ja|yes|gut|passt)[\s,.!]+)?(?:alle?\s+|all\s+)?(?:deine\s+|your\s+|die\s+|the\s+)?"
                       r"(?:empfehlung(?:en)?|recommendations?|ok(?:ay)?|einverstanden|agreed|wie\s+empfohlen|"
@@ -177,6 +181,8 @@ def _answers_decision(text: str) -> bool:
         return True
     if "?" not in t:
         return True
+    if _DECISION_NUMBER.search(t):
+        return True  # 0.4.9 (z11): '8. A / 9. B ?' answers 8 and 9; the '?' does not make it a question
     head = _ANSWER_START.match(t)
     if not head:
         return False
@@ -220,6 +226,11 @@ DEFAULTS = {
     # background processes ends when none of them runs, or after background_wait_max seconds (0 = off).
     "background_watch_every": 60,
     "background_wait_max": 3600,
+    # 0.4.9 (z11): no watchdog continuation while a turn of the session runs (a turn mark older than
+    # turn_active_max seconds does not count: a hard-stopped turn never ends); and a grace of
+    # background_end_grace seconds after the first tick that sees all awaited processes ended.
+    "turn_active_max": 600,
+    "background_end_grace": 120,
 }
 
 FINAL_REPORT_NUDGE = (
@@ -873,6 +884,52 @@ def _note_background(state: "GoalState", session_id: str, platform: str) -> None
                      "session_key": keys[0] if keys else state.bg_wait.get("session_key", "")}
 
 
+def _turn_marks() -> dict:
+    """0.4.9 (z11): the running turns of this process as {session id or chat key: last activity}. The
+    dict lives in a holder module, so a plugin reload keeps it (the watchdog thread calls the new module)."""
+    holder = sys.modules.get("goal_loop_turns")
+    if holder is None:
+        import types
+        holder = types.ModuleType("goal_loop_turns")
+        holder.MARKS = {}
+        sys.modules["goal_loop_turns"] = holder
+    return holder.MARKS
+
+
+def _mark_turn(*keys: Any, now: Optional[float] = None) -> None:
+    marks = _turn_marks()
+    t = time.time() if now is None else now
+    for k in keys:
+        if k:
+            marks[str(k)] = t
+
+
+def _touch_turn(*keys: Any) -> None:
+    """Refresh the mark of a turn that runs (tool calls), so a long turn is not taken as stale."""
+    marks = _turn_marks()
+    t = time.time()
+    for k in keys:
+        if k and str(k) in marks:
+            marks[str(k)] = t
+
+
+def _end_turn(*keys: Any) -> None:
+    marks = _turn_marks()
+    for k in keys:
+        if k:
+            marks.pop(str(k), None)
+
+
+def _turn_active(chat_key: str, session_id: str, now: float, settings: "Settings") -> bool:
+    limit = float(settings.get("turn_active_max") or 0)
+    marks = _turn_marks()
+    for k in (chat_key, session_id):
+        t = marks.get(str(k)) if k else None
+        if t is not None and (not limit or now - float(t) < limit):
+            return True
+    return False
+
+
 _WATCH_TEXT = ("[goal-loop resume {nonce}] Follow-up run of the goal loop (no owner message): the background "
                "process(es) {procs} that the loop waited for {why}. Read their results (process tool or "
                "their output files) and continue the work on the open goals of this chat.")
@@ -909,6 +966,19 @@ def background_watchdog_tick(store: GoalStore, settings: "Settings", now: Option
         age = now - float(wait.get("since") or now)
         if alive and not (limit and age >= limit):
             continue
+        # 0.4.9 (z11): a turn of this chat runs (for example the completion-notice turn): that turn
+        # decides; a mark older than turn_active_max does not count (a hard-stopped turn never ends).
+        if _turn_active(state.chat_key, str(wait.get("session") or ""), now, settings):
+            continue
+        grace = float(settings.get("background_end_grace") or 0)
+        if not alive and grace:
+            seen = wait.get("ended_seen")
+            if not seen:
+                state.bg_wait = {**wait, "ended_seen": now}
+                store.save(state)
+                continue
+            if now - float(seen) < grace:
+                continue
         why = "ended without a completion turn" if not alive else f"still run after {int(age // 60)} min"
         if state.boot_id and state.boot_id != BOOT_ID:
             if not wait.get("held_noted"):
@@ -1320,6 +1390,7 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
         if platform in EXCLUDED_PLATFORMS:
             return None
         _note_turn_end(store, session_id)
+        _end_turn(session_id, _chat_key(conversation_id or session_id))  # 0.4.9 (z11)
         body = response_text if isinstance(response_text, str) and response_text else text
         if not isinstance(body, str):
             return None
@@ -1580,6 +1651,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             return None
         try:
             text = _message_text(user_message).strip()
+            _mark_turn(session_id, _chat_key(_.get("conversation_id") or session_id))  # 0.4.9 (z11)
             _note_turn_start(store, session_id, platform, _.get("conversation_id"), model, settings)
             if _is_follow_up(store, session_id, _.get("conversation_id"), text):
                 # L15: a follow-up run of the plugin is never an owner message (no go, no
@@ -1708,6 +1780,7 @@ def make_post_tool_call(store: GoalStore):
                         **_: Any) -> None:
         if not tool_name or tool_name in _NO_PROGRESS_TOOLS:
             return None
+        _touch_turn(session_id, _chat_key(conversation_id or session_id))  # 0.4.9 (z11)
         try:
             key = _chat_key(conversation_id or session_id)
             if not store.exists(key):
