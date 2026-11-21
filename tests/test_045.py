@@ -76,14 +76,16 @@ class OwnerQuestionKeepsDecisionTest(unittest.TestCase):
         return tools, store, s
 
     def test_an_owner_question_does_not_lift_the_open_decision(self):
-        tools, store, s = self._waiting()
-        owner(store, "wie können wir das verhindern?", settings=s)
-        with fake_modules():
-            tool(store)
-            self.assertIsNone(stop_with(store, s, "Antwort auf die Frage ohne Stopp-Grund"))
-        events = ledger_events(store)
-        self.assertNotIn("continued", events[events.index("decision"):])
-        self.assertIn("owner_question_kept_wait", events)
+        for question in ("wie können wir das verhindern?", "Was bedeutet Option B?",
+                         "was ist so st noch offen?"):
+            tools, store, s = self._waiting()
+            owner(store, question, settings=s)
+            with fake_modules():
+                tool(store)
+                self.assertIsNone(stop_with(store, s, "Antwort auf die Frage ohne Stopp-Grund"), question)
+            events = ledger_events(store)
+            self.assertNotIn("continued", events[events.index("decision"):], question)
+            self.assertIn("owner_question_kept_wait", events)
 
     def test_go_lifts_the_decision_wait(self):
         tools, store, s = self._waiting()

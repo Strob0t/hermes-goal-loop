@@ -113,16 +113,16 @@ def _stop_cause(text: Any) -> str:
     return found[-1].lower() if found else ""
 
 
-# An option answer: "A", "4a", "r4b A", "2A", or the words "Empfehlung"/"recommendation"/"ok".
-_ANSWER_TOKEN = re.compile(r"(?<![\w])(?:\d{1,2}[a-dA-D]|[A-D]|ok|okay|empfehlung|recommendation|"
-                           r"einverstanden|agreed|ja|yes)(?![\w])", re.IGNORECASE)
-_ANSWER_TOKEN_CASED = re.compile(r"(?<![\w])(?:\d{1,2}[a-dA-D]|[A-D])(?![\w])")
+# An option answer at the start of a message: "A", "4a", "r4b A", "r32 ok", "2A, ...", "ok", "Empfehlung".
+_ANSWER_START = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D]|ok|okay|empfehlung|recommendation|"
+                           r"einverstanden|agreed)(?![\w])", re.IGNORECASE)
+_ANSWER_START_CASED = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D])(?![\w])")
 
 
 def _answers_decision(text: str) -> bool:
     """0.4.5 (r32): True when an owner message answers an open decision; False for a question.
     A go word, or a message without '?', is an answer; a message with '?' is an answer only when it
-    also names an option (e.g. '4a', 'A', 'Empfehlung', 'ok')."""
+    starts with an option (e.g. '4a', 'r4b A', 'ok', 'Empfehlung'). 'Was bedeutet Option B?' is a question."""
     t = (text or "").strip()
     if not t:
         return False
@@ -130,9 +130,12 @@ def _answers_decision(text: str) -> bool:
         return True
     if "?" not in t:
         return True
-    words = _ANSWER_TOKEN.findall(t)
-    return any(w.lower() in ("ok", "okay", "empfehlung", "recommendation", "einverstanden", "agreed")
-               for w in words) or bool(_ANSWER_TOKEN_CASED.search(t))
+    head = _ANSWER_START.match(t)
+    if not head:
+        return False
+    word = head.group(0).split()[-1].lower()
+    return word in ("ok", "okay", "empfehlung", "recommendation", "einverstanden", "agreed") or bool(
+        _ANSWER_START_CASED.match(t))
 
 # ``cron`` is the owner rule (no loop in scheduled runs). ``subagent``: a delegated child (the judge)
 # inherits the parent's conversation_id, so the loop must not drive it (F7).
