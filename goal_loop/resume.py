@@ -104,6 +104,22 @@ def mark(path: str, status: str) -> None:
         _write(path, data)
 
 
+BIND_DIR = "goal-loop-bind"
+
+
+def write_bind_hint(home: str, script: str, owui_key: str) -> Optional[str]:
+    """Write <home>/cron/goal-loop-bind/<script stem>.json with the Open WebUI key; returns the path or None."""
+    folder = os.path.join(home, "cron", BIND_DIR)
+    path = os.path.join(folder, os.path.splitext(script)[0] + ".json")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        _write(path, {"owui_key": owui_key, "written": time.time()})
+    except OSError:
+        logger.warning("goal-loop: bind hint not written", exc_info=True)
+        return None
+    return path
+
+
 def schedule_resume(state_dir: str, chat_key: str, session_id: str, model: str, delay: str,
                     stale_after: float = 7200.0, create_job: Optional[Callable[..., dict]] = None,
                     hermes_home: Optional[str] = None, now: Optional[float] = None,
@@ -137,6 +153,13 @@ def schedule_resume(state_dir: str, chat_key: str, session_id: str, model: str, 
         with open(wrapper + ".tmp", "w", encoding="utf-8") as handle:
             handle.write(text)
         os.replace(wrapper + ".tmp", wrapper)
+    owui_key = str((extra or {}).get("owui_key") or "")
+    if owui_key:
+        # 0.4.5 (r34): the bind hint for the homelab delivery adapter. The resumed turn is not open when the
+        # job is made, so the adapter cannot bind the job by its session map; it reads this file instead
+        # (<HERMES_HOME>/cron/goal-loop-bind/<script stem>.json). Written before the job, so it is there at
+        # the adapter's first sight of the job.
+        write_bind_hint(home, name, owui_key)
     request = {"chat_key": chat_key, "session_id": session_id, "model": model or "",
                "nonce": secrets.token_hex(8), "created": now, "status": "scheduled", **(extra or {})}
     _write(path, request)
