@@ -92,7 +92,9 @@ the session authority stores its user row as `internal_notification` with
 `display_metadata.api_inbound` (`gateway/session_ingress.py`). These turns do not count: a
 gateway notification (the text ends with the `[INTERNAL NOTIFICATION ...]` footer), a turn
 whose user row has another synthesized `display_kind` (a typed `/steer` row counts), an
-empty turn, and the `cron` and `subagent` platforms. The count is kept in
+empty turn, a turn that starts with `[Your active task list was preserved across context compression]` (the task
+list that Hermes restores after a compression, 0.4.4), and the `cron` and `subagent` platforms. An owner message
+that interrupts a running turn counts through the `pre_api_request` hook (0.4.4). The count is kept in
 `gate_<chat>.json` in the state folder, keyed on the chat (see "Where the state lives").
 After the go, a changed goal list needs one more owner message (`change_<chat>.json`), and a
 paused goal resumes with `goal_go` after a new owner message.
@@ -123,7 +125,10 @@ started before the plugin update gets the hint only after a new session.
 - `pre_stop`: continuation with the open goals (text, check, progress), budget, idle and restart limits.
 - `transform_llm_output`: status display in the owner language; one line when a turn ends with open goals.
 - `pre_llm_call`: owner-message count (go and change gates), stop words, language votes, goal context for each owner turn.
-- `post_tool_call`: tool-call count for the idle detection.
+- `pre_api_request` (0.4.4): counts an owner message that interrupted a running turn (Hermes applies it as a
+  user row with the api_content prefix `[Context from the interrupted assistant response]` and starts no new
+  turn, so `pre_llm_call` does not run); each such row counts one time (ledger `owner_redirect_counted`).
+- `post_tool_call`: tool-call count for the idle detection (`todo_list` does not count, 0.4.4).
 - `pre_tool_call`: read-only guard for the judge child.
 
 Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_judge`.

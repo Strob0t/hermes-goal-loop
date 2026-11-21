@@ -210,7 +210,7 @@ class JudgeRetryTest(unittest.TestCase):
         for key in ("judge_attempts", "judge_attempt_timeout", "judge_backoff", "stale_days"):
             self.assertIn(key, readme)
         yaml = open(os.path.join(root, "goal_loop", "plugin.yaml"), encoding="utf-8").read()
-        self.assertIn("version: 0.4.3", yaml)
+        self.assertRegex(yaml, r"version: 0\.4\.[3-9]")
 
 
 class StalePauseTest(unittest.TestCase):

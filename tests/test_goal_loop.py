@@ -831,7 +831,7 @@ class RegisterTest(unittest.TestCase):
             self.assertEqual(names, {"goal_set", "goal_go", "goal_status", "goal_claim",
                                      "goal_decision", "goal_block", "goal_progress"})
             self.assertEqual(set(ctx.hooks), {"pre_stop", "transform_llm_output", "pre_llm_call",
-                                              "post_tool_call", "pre_tool_call"})
+                                              "pre_api_request", "post_tool_call", "pre_tool_call"})
             self.assertIn(PROMPT_SECTION_ID, ctx.sections)
             self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "api_server"}), USAGE_HINT)
             self.assertEqual(ctx.sections[PROMPT_SECTION_ID]({"platform": "subagent"}), "")

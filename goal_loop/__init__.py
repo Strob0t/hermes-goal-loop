@@ -38,6 +38,7 @@ The plugin never starts a turn in an API session and never edits core files (plu
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -168,7 +169,15 @@ _STEER_DISPLAY_KIND = "steer"
 _API_TURN_DISPLAY_KIND = "internal_notification"
 
 # Tools that do not show progress on a goal (idle detection, L2).
-_NO_PROGRESS_TOOLS = frozenset({"goal_status", "goal_decision", "goal_go", "goal_set"})
+_NO_PROGRESS_TOOLS = frozenset({"goal_status", "goal_decision", "goal_go", "goal_set",
+                                # 0.4.4 (C7): a task-list update alone is no progress on a goal
+                                "todo_list", "todo"})
+# 0.4.4 (C7): Hermes restores the task list after a context compression as a turn that starts with
+# this line; it is no owner message (no go, no change approval).
+_TASK_LIST_RESTORE_PREFIX = "[Your active task list was preserved across context compression]"
+# 0.4.4: an owner message that interrupts a running turn (agent.redirect) does not start a new turn,
+# so pre_llm_call does not see it; Hermes appends it as a user row with this api_content prefix.
+_REDIRECT_PREFIX = "[Context from the interrupted assistant response]"
 
 # L12: tools a judge child may call, and terminal commands it must not run.
 _JUDGE_ALLOWED_TOOLS = frozenset({"read_file", "search_files", "terminal"})
@@ -1156,6 +1165,8 @@ def _is_owner_message(user_message: Any, conversation_history: Any) -> bool:
     text = _message_text(user_message).strip()
     if not text or _INTERNAL_FOOTER_PREFIX in text[-400:]:
         return False
+    if text.startswith(_TASK_LIST_RESTORE_PREFIX):
+        return False
     if isinstance(conversation_history, list):
         row = next((m for m in reversed(conversation_history)
                     if isinstance(m, dict) and m.get("role") == "user"), None)
@@ -1331,6 +1342,42 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
     return _pre_llm_call
 
 
+def make_pre_api_request(store: GoalStore, settings: Optional[Settings] = None):
+    """0.4.4: count an owner message that interrupted a running turn. Hermes applies it as a user row
+    with the api_content prefix _REDIRECT_PREFIX and does not start a new turn, so pre_llm_call does
+    not run for it. Each such row counts one time (go gate, change gate, stop word, wait lift)."""
+    settings = settings or Settings()
+    inner = make_pre_llm_call(store, settings)
+
+    def _pre_api_request(session_id: str = "", platform: str = "", conversation_history: Any = None,
+                         model: str = "", **_: Any) -> None:
+        if platform in EXCLUDED_PLATFORMS or not session_id or not isinstance(conversation_history, list):
+            return None
+        try:
+            index, row = next(((i, m) for i, m in reversed(list(enumerate(conversation_history)))
+                               if isinstance(m, dict) and m.get("role") == "user"), (-1, None))
+            if row is None or not str(row.get("api_content") or "").startswith(_REDIRECT_PREFIX):
+                return None
+            text = _message_text(row.get("content")).strip()
+            if not text:
+                return None
+            mark = hashlib.sha256(f"{index}\n{text}".encode("utf-8")).hexdigest()[:16]
+            seen = (store._read_side("redir", str(session_id)) or {}).get("seen") or []
+            if mark in seen:
+                return None
+            store._write_side("redir", str(session_id), {"seen": (seen + [mark])[-50:]})
+            store.append_ledger(_gate_for(store, session_id, _.get("conversation_id")),
+                                "owner_redirect_counted")
+            inner(session_id=session_id, platform=platform, user_message=text,
+                  conversation_history=conversation_history[:index + 1], model=model,
+                  conversation_id=_.get("conversation_id"))
+        except Exception:
+            logger.debug("goal-loop pre_api_request failed", exc_info=True)
+        return None
+
+    return _pre_api_request
+
+
 # --- Tool counting (post_tool_call) and the judge guard (pre_tool_call) -----------------------
 
 def make_post_tool_call(store: GoalStore):
@@ -1496,6 +1543,7 @@ def register(ctx) -> None:
     ctx.register_hook("pre_stop", make_pre_stop(store, settings))
     ctx.register_hook("transform_llm_output", make_transform_llm_output(store, settings))
     ctx.register_hook("pre_llm_call", make_pre_llm_call(store, settings))
+    ctx.register_hook("pre_api_request", make_pre_api_request(store, settings))
     ctx.register_hook("post_tool_call", make_post_tool_call(store))
     ctx.register_hook("pre_tool_call", make_pre_tool_call())
     register_section = getattr(ctx, "register_system_prompt_section", None)
@@ -1516,4 +1564,4 @@ def register(ctx) -> None:
             logger.info("goal-loop: %d restart resume(s) scheduled: %s", len(jobs), ", ".join(jobs))
     except Exception:
         logger.warning("goal-loop restart resume scan failed", exc_info=True)
-    logger.info("goal-loop plugin registered: 7 tools, 5 hooks, judge task, usage hint")
+    logger.info("goal-loop plugin registered: 7 tools, 6 hooks, judge task, usage hint")
