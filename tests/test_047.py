@@ -80,8 +80,11 @@ class DecisionsByNumberTest(unittest.TestCase):
         self.assertNotIn("Offene Entscheidungen", block_text(store, s))
 
     def test_an_answer_without_a_number_closes_all(self):
+        # 0.4.8 (z10): only explicit consent without a number closes all ('nimm die Empfehlung' closes none)
         tools, store, s = self._three()
         owner(store, "nimm die Empfehlung", settings=s)
+        self.assertEqual(len(store.load(_chat_key("s1")).open_decisions()), 3)
+        owner(store, "Empfehlung", settings=s)
         self.assertEqual(store.load(_chat_key("s1")).open_decisions(), [])
 
     def test_a_question_closes_none(self):
@@ -91,8 +94,8 @@ class DecisionsByNumberTest(unittest.TestCase):
 
     def test_goal_ids_are_no_decision_numbers(self):
         tools, store, s = self._three()
-        owner(store, "r4b A und z4 C", settings=s)  # no decision number: closes all (answer without number)
-        self.assertEqual(store.load(_chat_key("s1")).open_decisions(), [])
+        owner(store, "r4b A und z4 C", settings=s)  # 0.4.8 (z10): no decision number and no consent: closes none
+        self.assertEqual(len(store.load(_chat_key("s1")).open_decisions()), 3)
 
     def test_a_new_decision_after_the_answer_is_shown(self):
         tools, store, s = self._three()

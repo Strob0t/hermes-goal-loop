@@ -1,5 +1,7 @@
 """hermes-goal-loop — a goal loop for Hermes as a plugin (v0.3).
 
+0.4.8: an owner message closes decisions only on a number with an option, a go word or explicit consent;
+the goal block shows the numbers it closed.
 0.4.7: an owner answer closes decisions by number ('5A' closes decision 5; 'go' or an answer without a
 number closes all); the turn after a restart says that the loop is held; a watchdog continues a loop
 that waits for background processes that do not run any more (or after background_wait_max seconds);
@@ -128,13 +130,19 @@ _ANSWER_START_CASED = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-
 
 # 0.4.7 (z3): a decision number with an option letter: '5A', '2b', '4 C' (not 'r4b', not 'z4 C').
 _DECISION_NUMBER = re.compile(r"(?<![\w.])(\d{1,2})\s?[a-dA-D](?![\w])")
+# 0.4.8 (z10): explicit consent closes all open decisions ('Empfehlung', 'ok', 'alle Empfehlungen', ...).
+_CONSENT = re.compile(r"^\s*(?:(?:ja|yes|gut|passt)[\s,.!]+)?(?:alle?\s+|all\s+)?(?:deine\s+|your\s+|die\s+|the\s+)?"
+                      r"(?:empfehlung(?:en)?|recommendations?|ok(?:ay)?|einverstanden|agreed|wie\s+empfohlen|"
+                      r"as\s+recommended)(?![\w])", re.IGNORECASE)
 
 
 def _close_decisions(store: "GoalStore", state: "GoalState", text: str) -> list[int]:
-    """0.4.7 (z3): an owner answer closes decisions. A go word closes all open decisions; an answer
-    with numbers ('1A 2B') closes those numbers; an answer without a number closes all; a question
-    closes none. When decisions stay open, they are shown again (decisions_shown = 0). Returns the
-    closed numbers."""
+    """0.4.8 (z10): an owner message closes decisions only on (1) a decision number with an option
+    ('6A', '1c, 2b' close those numbers), (2) a go word (closes all), or (3) explicit consent at the start
+    ('Empfehlung', 'ok', 'alle Empfehlungen'; closes all). A request, an order or a question without a
+    number ('gib mir eine Liste ...', 'zeige ...', 'was bedeutet ...?') closes none. When decisions stay
+    open, they are shown again (decisions_shown = 0). Returns the closed numbers; they are shown once in
+    the next goal block (decisions_just_closed)."""
     open_numbers = [i for i, _ in state.open_decisions()]
     t = (text or "").strip()
     if not open_numbers or not t:
@@ -142,15 +150,16 @@ def _close_decisions(store: "GoalStore", state: "GoalState", text: str) -> list[
     numbers = {int(m.group(1)) for m in _DECISION_NUMBER.finditer(t)}
     if t.lower().strip(" .!") in GO_WORDS:
         close = open_numbers
-    elif not _answers_decision(t):
-        return []
     elif numbers:
         close = [i for i in open_numbers if i in numbers]
-    else:
+    elif _CONSENT.match(t):
         close = open_numbers
+    else:
+        return []
     if not close:
         return []
     state.decisions_closed = sorted(set(state.decisions_closed) | set(close))
+    state.decisions_just_closed = sorted(close)
     store.append_ledger(state.chat_key, "decisions_closed", numbers=close)
     if state.open_decisions():
         state.decisions_shown = 0  # show the decisions that stay open once more
@@ -1207,12 +1216,13 @@ def _display_block(state: GoalState, language: str = "en") -> str:
                    if g.status in ("blocked", "paused") and not g.done and not g.block_shown]
     start = min(max(state.decisions_shown, 0), len(state.decisions))
     decisions = [(index, text) for index, text in state.open_decisions() if index > start]
-    if not owner_goals and not decisions:
+    closed, state.decisions_just_closed = list(state.decisions_just_closed), []  # 0.4.8 (z10): show once
+    if not owner_goals and not decisions and not closed:
         return ""
     for goal in owner_goals:
         goal.block_shown = True
     state.decisions_shown = len(state.decisions)
-    return owner_block(owner_goals, decisions, language)
+    return owner_block(owner_goals, decisions, language, closed=closed)
 
 
 def _cancel_follow_up(store: GoalStore, chat_key: str) -> None:

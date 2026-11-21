@@ -45,6 +45,7 @@ OWNER_STATUSES = ("blocked", "paused")
 LABELS = {
     "en": {
         "title": "Goal status:", "title_owner": "Goal status (needs the owner):",
+        "closed": "Closed by your answer: {nums}",
         "decisions": "Open decisions:", "check": "check", "go_question": "Do you give the go?",
         "no_report": "(no final report from the model)", "progress": "progress",
         "status": {"open": "open", "in_work": "in work", "waiting": "waiting", "paused": "paused",
@@ -52,6 +53,7 @@ LABELS = {
     },
     "de": {
         "title": "Zielstatus:", "title_owner": "Zielstatus (braucht dich):",
+        "closed": "Mit deiner Antwort geschlossen: {nums}",
         "decisions": "Offene Entscheidungen:", "check": "Prüfung", "go_question": "Gibst du das Go?",
         "no_report": "(kein Abschlussbericht vom Modell)", "progress": "Fortschritt",
         "status": {"open": "offen", "in_work": "in Arbeit", "waiting": "wartet", "paused": "pausiert",
@@ -135,6 +137,8 @@ class GoalState:
     bg_wait: dict = field(default_factory=dict)
     # 0.4.7 (z4): the boot id for which the restart line was shown (one time per restart).
     restart_note_boot: str = ""
+    # 0.4.8 (z10): the numbers that the last owner message closed; shown once in the next goal block.
+    decisions_just_closed: list[int] = field(default_factory=list)
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.
@@ -176,6 +180,7 @@ class GoalState:
             decisions_closed=[int(i) for i in data.get("decisions_closed", []) if str(i).isdigit()],
             bg_wait=dict(data.get("bg_wait") or {}),
             restart_note_boot=str(data.get("restart_note_boot", "")),
+            decisions_just_closed=[int(i) for i in data.get("decisions_just_closed", []) if str(i).isdigit()],
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),
@@ -437,12 +442,16 @@ def status_block(state: GoalState, language: str = "en", go_question: bool = Fal
     return "\n".join(lines)
 
 
-def owner_block(blocked: list[Goal], decisions: list[tuple[int, str]], language: str = "en") -> str:
-    """Render only the items that need the owner: newly blocked or paused goals and new decisions."""
-    if not blocked and not decisions:
+def owner_block(blocked: list[Goal], decisions: list[tuple[int, str]], language: str = "en",
+                closed: Optional[list[int]] = None) -> str:
+    """Render only the items that need the owner: newly blocked or paused goals and new decisions;
+    0.4.8 (z10): with the numbers that the last owner message closed."""
+    if not blocked and not decisions and not closed:
         return ""
     lab = labels(language)
     lines = ["", "---", lab["title_owner"]]
+    if closed:
+        lines.append(lab["closed"].format(nums=", ".join(str(i) for i in closed)))
     for goal in blocked:
         lines.append(_goal_line(goal, language))
     if decisions:
