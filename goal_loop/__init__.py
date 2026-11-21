@@ -1,5 +1,10 @@
 """hermes-goal-loop — a goal loop for Hermes as a plugin (v0.3).
 
+0.4.7: an owner answer closes decisions by number ('5A' closes decision 5; 'go' or an answer without a
+number closes all); the turn after a restart says that the loop is held; a watchdog continues a loop
+that waits for background processes that do not run any more (or after background_wait_max seconds);
+each resume turn writes one INFO line with its nonce and job id.
+
 0.4.5 (r32): the stop-cause line of an answer (done, owner-question, blocker) holds the loop until
 the next owner message; an owner question does not lift an open owner decision (only go, an answer
 that names an option, or a message without a question mark does).
@@ -46,6 +51,8 @@ import hashlib
 import logging
 import os
 import re
+import sys
+import threading
 import time
 import uuid
 from typing import Any, Mapping, Optional
@@ -119,6 +126,37 @@ _ANSWER_START = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D]|ok|
 _ANSWER_START_CASED = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D])(?![\w])")
 
 
+# 0.4.7 (z3): a decision number with an option letter: '5A', '2b', '4 C' (not 'r4b', not 'z4 C').
+_DECISION_NUMBER = re.compile(r"(?<![\w.])(\d{1,2})\s?[a-dA-D](?![\w])")
+
+
+def _close_decisions(store: "GoalStore", state: "GoalState", text: str) -> list[int]:
+    """0.4.7 (z3): an owner answer closes decisions. A go word closes all open decisions; an answer
+    with numbers ('1A 2B') closes those numbers; an answer without a number closes all; a question
+    closes none. When decisions stay open, they are shown again (decisions_shown = 0). Returns the
+    closed numbers."""
+    open_numbers = [i for i, _ in state.open_decisions()]
+    t = (text or "").strip()
+    if not open_numbers or not t:
+        return []
+    numbers = {int(m.group(1)) for m in _DECISION_NUMBER.finditer(t)}
+    if t.lower().strip(" .!") in GO_WORDS:
+        close = open_numbers
+    elif not _answers_decision(t):
+        return []
+    elif numbers:
+        close = [i for i in open_numbers if i in numbers]
+    else:
+        close = open_numbers
+    if not close:
+        return []
+    state.decisions_closed = sorted(set(state.decisions_closed) | set(close))
+    store.append_ledger(state.chat_key, "decisions_closed", numbers=close)
+    if state.open_decisions():
+        state.decisions_shown = 0  # show the decisions that stay open once more
+    return close
+
+
 def _answers_decision(text: str) -> bool:
     """0.4.5 (r32): True when an owner message answers an open decision; False for a question.
     A go word, or a message without '?', is an answer; a message with '?' is an answer only when it
@@ -169,6 +207,10 @@ DEFAULTS = {
     # r4: a turn that a Hermes restart cut off gets one continuation turn after the start.
     "restart_resume": True,
     "restart_resume_delay": "2m",
+    # 0.4.7 (z5): the background watchdog checks every background_watch_every seconds; a wait for
+    # background processes ends when none of them runs, or after background_wait_max seconds (0 = off).
+    "background_watch_every": 60,
+    "background_wait_max": 3600,
 }
 
 FINAL_REPORT_NUDGE = (
@@ -312,6 +354,8 @@ DECISION_TEXT = {
         "paused_line": "Der Loop ist pausiert: {n} Ziel(e) sind offen ({gids}). Schreibe 'weiter', "
                        "damit er fortfährt.",
         "owner_stop": "Der Loop ist auf deinen Wunsch pausiert. Mit 'go' geht es weiter.",
+        "restart_line": ("Neustart: Schleife angehalten, schreib weiter, damit sie fortfährt "
+                         "({n} Ziel(e) offen: {gids})."),
         "resume_line": ("Der Loop läuft in {delay} in einem Folge-Run weiter: {n} Ziel(e) offen "
                         "({gids}). Die Antwort erscheint in diesem Chat. Mit 'stopp' hältst du ihn an."),
         "wait_line": ("Der Loop wartet ({why}): {n} Ziel(e) offen ({gids}). Er läuft weiter, "
@@ -339,6 +383,7 @@ DECISION_TEXT = {
                    "the goal. Recommendation: B, because the same way failed {n} times."),
         "paused_line": "The loop is paused: {n} goal(s) are open ({gids}). Write 'continue' to go on.",
         "owner_stop": "The loop is paused as you asked. Answer 'go' to continue.",
+        "restart_line": ("Restart: loop held, write 'continue' to go on ({n} goal(s) open: {gids})."),
         "resume_line": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open "
                         "({gids}). The answer appears in this chat. Write 'stop' to halt it."),
         "wait_line": ("The loop waits ({why}): {n} goal(s) open ({gids}). It goes on when the result "
@@ -631,9 +676,10 @@ class _Tools:
         if not text:
             return "error: decision text is required"
         state.decisions.append(text)
-        self.store.append_ledger(state.chat_key, "decision", text=text[:200])
+        self.store.append_ledger(state.chat_key, "decision", text=text[:200], number=len(state.decisions))
         self.store.save(state)
-        return f"Decision recorded ({len(state.decisions)} open). It will appear in the decision list."
+        return (f"Decision {len(state.decisions)} recorded ({len(state.open_decisions())} open). "
+                "It will appear in the decision list.")
 
     def goal_block(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self._load(kwargs)
@@ -770,8 +816,15 @@ class _Tools:
 def _background_wait(session_id: str) -> bool:
     """A background process of this session that reports at its end (notify_on_complete) or waits for
     a watch pattern is still running (tools.process_registry). Fail-safe: any error gives False."""
+    return bool(_awaited_processes(session_id))
+
+
+def _awaited_processes(session_id: str) -> list[dict]:
+    """0.4.7 (z5): the running background processes of this session that the loop waits for, as
+    {id, session_key}. Fail-safe: any error gives []."""
+    out: list[dict] = []
     if not session_id:
-        return False
+        return out
     try:
         from tools.process_registry import process_registry
         with process_registry._lock:
@@ -782,10 +835,127 @@ def _background_wait(session_id: str) -> bool:
             if proc.exited or not (proc.notify_on_complete or proc.watch_patterns):
                 continue
             if process_registry.is_session_waiting(proc.id):
-                return True
+                out.append({"id": str(proc.id), "session_key": str(getattr(proc, "session_key", "") or "")})
     except Exception:
         logger.debug("goal-loop background wait check failed", exc_info=True)
-    return False
+    return out
+
+
+def _process_running(proc_id: str) -> bool:
+    """0.4.7 (z5): the process is still in the live registry and has not exited."""
+    try:
+        from tools.process_registry import process_registry
+        with process_registry._lock:
+            proc = process_registry._running.get(proc_id)
+        return proc is not None and not proc.exited
+    except Exception:
+        return True  # unknown: do not continue on a guess
+
+
+def _note_background(state: "GoalState", session_id: str, platform: str) -> None:
+    """0.4.7 (z5): remember the awaited processes (the first time of this wait keeps 'since')."""
+    procs = _awaited_processes(session_id)
+    if not procs:
+        return
+    ids = sorted(set(state.bg_wait.get("procs", [])) | {p["id"] for p in procs})
+    keys = [p["session_key"] for p in procs if p["session_key"]]
+    state.bg_wait = {"procs": ids, "since": state.bg_wait.get("since") or time.time(),
+                     "session": str(session_id), "platform": str(platform or ""),
+                     "session_key": keys[0] if keys else state.bg_wait.get("session_key", "")}
+
+
+_WATCH_TEXT = ("[goal-loop resume {nonce}] Follow-up run of the goal loop (no owner message): the background "
+               "process(es) {procs} that the loop waited for {why}. Read their results (process tool or "
+               "their output files) and continue the work on the open goals of this chat.")
+
+
+def background_watchdog_tick(store: GoalStore, settings: "Settings", now: Optional[float] = None,
+                             running: Optional[Any] = None, inject: Optional[Any] = None,
+                             schedule: Optional[Any] = None) -> list[str]:
+    """0.4.7 (z5): continue each loop that waits for background processes when none of them runs any
+    more (killed by a restart, or its completion turn was cut off) or when the wait is older than
+    background_wait_max. A state of another boot stays held (restart rule, ledger only). Returns the chat
+    keys that were continued."""
+    now = time.time() if now is None else now
+    running = running or _process_running
+    limit = float(settings.get("background_wait_max") or 0)
+    done = []
+    try:
+        names = sorted(os.listdir(store.base_dir))
+    except OSError:
+        return done
+    for name in names:
+        if not (name.startswith("chat_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(store.base_dir, name), encoding="utf-8") as handle:
+                state = GoalState.from_json(handle.read())
+        except Exception:
+            continue
+        wait = state.bg_wait
+        if not (state.go and wait and state.wait_reason == "waiting_background" and state.open_goals()):
+            continue
+        procs = list(wait.get("procs", []))
+        alive = [p for p in procs if running(p)]
+        age = now - float(wait.get("since") or now)
+        if alive and not (limit and age >= limit):
+            continue
+        why = "ended without a completion turn" if not alive else f"still run after {int(age // 60)} min"
+        if state.boot_id and state.boot_id != BOOT_ID:
+            if not wait.get("held_noted"):
+                state.bg_wait = {**wait, "held_noted": True}
+                store.append_ledger(state.chat_key, "background_watchdog_held", procs=procs)
+                store.save(state)
+            continue
+        import secrets
+        nonce = secrets.token_hex(8)
+        text = _WATCH_TEXT.format(nonce=nonce, procs=", ".join(procs) or "-", why=why)
+        platform = str(wait.get("platform") or "")
+        ok = False
+        try:
+            if platform == "api_server":
+                ok = bool((schedule or _schedule_follow_up)(store, state, settings, str(wait.get("session") or "")))
+            else:
+                send = inject or getattr(getattr(sys.modules.get(__name__), "_CTX", None), "inject_message", None)
+                key = str(wait.get("session_key") or "")
+                ok = bool(callable(send) and key and send(text, session_key=key))
+        except Exception:
+            logger.debug("goal-loop background watchdog: continuation failed", exc_info=True)
+        state.wait_reason = ""
+        state.bg_wait = {}
+        store.append_ledger(state.chat_key, "background_watchdog", procs=procs, alive=alive,
+                            why="timeout" if alive else "ended", continued=ok, nonce=nonce)
+        store.save(state)
+        if ok:
+            logger.info("goal-loop background watchdog: %s continued (%s %s)", state.chat_key,
+                        ", ".join(procs), why)
+            done.append(state.chat_key)
+    return done
+
+
+_WATCHDOG_NAME = "goal-loop-background-watchdog"
+
+
+def _start_watchdog(settings: "Settings") -> None:
+    """0.4.7 (z5): one daemon thread per process; after a plugin reload the thread calls the newest
+    module (sys.modules), so a reload does not start a second thread."""
+    if any(t.name == _WATCHDOG_NAME and t.is_alive() for t in threading.enumerate()):
+        return
+    name = __name__
+
+    def loop() -> None:
+        while True:
+            mod = sys.modules.get(name)
+            every = 60.0
+            try:
+                cfg = getattr(mod, "_SETTINGS", None) or settings
+                every = float(cfg.get("background_watch_every") or 60)
+                mod.background_watchdog_tick(mod.GoalStore(mod._state_dir()), cfg)
+            except Exception:
+                logger.debug("goal-loop background watchdog tick failed", exc_info=True)
+            time.sleep(max(every, 10.0))
+
+    threading.Thread(target=loop, name=_WATCHDOG_NAME, daemon=True).start()
 
 
 def _delegation_wait(session_id: str) -> bool:
@@ -878,6 +1048,8 @@ _WAIT_TEXT = {
 
 def _wait_note(store: GoalStore, state: GoalState, reason: str) -> None:
     """One ledger line per change of the wait reason (not one per turn)."""
+    if reason != "waiting_background":
+        state.bg_wait = {}
     if state.wait_reason != reason:
         state.wait_reason = reason
         store.append_ledger(state.chat_key, reason, open=[g.id for g in state.open_goals()])
@@ -958,10 +1130,13 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
         if why:
             _wait_note(store, state, why)
+            if why == "waiting_background":
+                _note_background(state, session_id, platform)  # 0.4.7 (z5)
             store.save(state)
             return None
         if state.wait_reason:
             state.wait_reason = ""
+        state.bg_wait = {}
         state.nudge_seq += 1
         state.continuations = attempt + 1
         # 0.4.2: every continuation is visible in the ledger (also after a stop turn).
@@ -1031,8 +1206,7 @@ def _display_block(state: GoalState, language: str = "en") -> str:
     owner_goals = [g for g in state.goals
                    if g.status in ("blocked", "paused") and not g.done and not g.block_shown]
     start = min(max(state.decisions_shown, 0), len(state.decisions))
-    decisions = [(index, text) for index, text in enumerate(state.decisions, start=1)
-                 if index > start]
+    decisions = [(index, text) for index, text in state.open_decisions() if index > start]
     if not owner_goals and not decisions:
         return ""
     for goal in owner_goals:
@@ -1076,6 +1250,7 @@ def _schedule_follow_up(store: GoalStore, state: GoalState, settings: Settings,
 
 # Issue #1: the PluginContext, for inject_message (a follow-up turn of a local session).
 _CTX: Any = None
+_SETTINGS: Any = None
 LOCAL_PLATFORMS = ("local", "cli", "tui", "desktop")
 
 
@@ -1166,6 +1341,8 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
         if why:
             _wait_note(store, state, why)
+            if why == "waiting_background":
+                _note_background(state, session_id, platform)  # 0.4.7 (z5)
             tail = "\n\n" + _dtext(lang)["wait_line"].format(
                 why=_WAIT_TEXT[why][1 if lang == "de" else 0], n=len(open_goals),
                 gids=", ".join(g.id for g in open_goals))
@@ -1181,6 +1358,13 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
         elif open_goals and settings.get("paused_hint"):
             tail = "\n\n" + _dtext(lang)["paused_line"].format(
                 n=len(open_goals), gids=", ".join(g.id for g in open_goals))
+        if held and state.go and state.unfinished() and state.restart_note_boot != BOOT_ID:
+            # 0.4.7 (z4): the first answer after a restart says that the loop is held (rule L13).
+            state.restart_note_boot = BOOT_ID
+            store.append_ledger(state.chat_key, "restart_hold_note",
+                                open=[g.id for g in state.unfinished()])
+            tail += "\n\n" + _dtext(lang)["restart_line"].format(
+                n=len(state.unfinished()), gids=", ".join(g.id for g in state.unfinished()))
         if not block and not tail:
             return None
         try:
@@ -1280,6 +1464,25 @@ def _is_follow_up(store: GoalStore, session_id: Any, conversation_id: Any, text:
     return resume.is_resume_text(text)
 
 
+def _log_resume_turn(store: GoalStore, key: str, session_id: Any, text: str) -> None:
+    """0.4.7 (z6): one INFO line in agent.log at the start of a resume turn, with the nonce of the turn
+    and the cron job id of its request (follow-up run: request of the chat; restart resume: request
+    'restart:<session>'). The Hermes log line of the turn shows only the first characters of the text."""
+    try:
+        from . import resume
+        nonce = resume.nonce_of(text)
+        sid = str(session_id or "")
+        for chat in (key, "restart:" + sid):
+            request = resume.load_request(resume.request_path(store.base_dir, chat))
+            if request and request.get("nonce") == nonce:
+                logger.info("goal-loop resume turn: nonce=%s job=%s reason=%s session=%s", nonce,
+                            request.get("job_id") or "-", request.get("reason") or "follow-up", sid)
+                return
+        logger.info("goal-loop resume turn: nonce=%s job=- reason=inject session=%s", nonce, sid)
+    except Exception:
+        logger.debug("goal-loop resume log line failed", exc_info=True)
+
+
 def _take_request(store: GoalStore, key: str, text: str) -> None:
     """The follow-up turn of request N started: mark N as taken, so the end of this turn can
     schedule the next follow-up run (a request that is only "running" still blocks a new one)."""
@@ -1372,6 +1575,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 # L15: a follow-up run of the plugin is never an owner message (no go, no
                 # change approval, no restart re-arm); it gets the goal context.
                 key = _gate_for(store, session_id, _.get("conversation_id"))
+                _log_resume_turn(store, key, session_id, text)  # 0.4.7 (z6)
                 _take_request(store, key, text)
                 if store.exists(key):
                     state = store.load(key)
@@ -1427,6 +1631,11 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                     _lift_decision_wait(store, state, "owner_answer")
                 else:
                     store.append_ledger(state.chat_key, "owner_question_kept_wait")
+                store.save(state)
+            if _close_decisions(store, state, text):  # 0.4.7 (z3)
+                store.save(state)
+            if state.bg_wait:  # 0.4.7 (z5): the owner answered; the watchdog has nothing to do
+                state.bg_wait = {}
                 store.save(state)
             if state.idle_resumes or state.tool_calls_at_resume >= 0:
                 # 0.4.2: an owner message starts a new count of idle follow-up runs.
@@ -1604,10 +1813,11 @@ def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float
 
 def register(ctx) -> None:
     """Register the goal tools, the hooks, the judge task and the usage hint."""
-    global _CTX
+    global _CTX, _SETTINGS
     _CTX = ctx
     store = GoalStore(_state_dir(), parent_of=_parent_session)
     settings = Settings(ctx)
+    _SETTINGS = settings
     tools = _Tools(store, ctx, settings)
     register_task = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_task):
@@ -1666,4 +1876,8 @@ def register(ctx) -> None:
             logger.info("goal-loop: %d restart resume(s) scheduled: %s", len(jobs), ", ".join(jobs))
     except Exception:
         logger.warning("goal-loop restart resume scan failed", exc_info=True)
-    logger.info("goal-loop plugin registered: 7 tools, 6 hooks, judge task, usage hint")
+    try:
+        _start_watchdog(settings)  # 0.4.7 (z5)
+    except Exception:
+        logger.warning("goal-loop background watchdog not started", exc_info=True)
+    logger.info("goal-loop plugin registered: 7 tools, 6 hooks, judge task, usage hint, background watchdog")

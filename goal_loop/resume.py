@@ -71,12 +71,33 @@ def _cron_create_job() -> Optional[Callable[..., dict]]:
     return create_job
 
 
+_NOTE_HEAD = "[System note:"
+
+
+def _resume_start(text: str) -> int:
+    """Index of the resume prefix: at the start, or (0.4.7) directly after the system note that Hermes
+    puts in front of a turn after a restart (gateway/run.py, 'The previous turn was interrupted by ...').
+    -1 when the text is no resume text."""
+    t = (text or "").lstrip()
+    if t.startswith(RESUME_PREFIX):
+        return len(text or "") - len(t)
+    if t.startswith(_NOTE_HEAD):
+        end = t.find("]\n")
+        rest = t[end + 1:].lstrip() if end >= 0 else ""
+        if rest.startswith(RESUME_PREFIX):
+            return len(text) - len(rest)
+    return -1
+
+
 def is_resume_text(text: str) -> bool:
-    return text.lstrip().startswith(RESUME_PREFIX)
+    return _resume_start(text) >= 0
 
 
 def nonce_of(text: str) -> str:
-    rest = text.lstrip()[len(RESUME_PREFIX):]
+    start = _resume_start(text)
+    if start < 0:
+        return ""
+    rest = text[start + len(RESUME_PREFIX):]
     return rest.split("]", 1)[0].strip() if "]" in rest else ""
 
 

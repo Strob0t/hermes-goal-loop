@@ -128,6 +128,13 @@ class GoalState:
     # and the decision wait that only go or an answer to the decision lifts (not an owner question).
     stop_hold: str = ""
     decision_wait: bool = False
+    # 0.4.7 (z3): numbers (1-based) of the decisions that an owner answer closed; they are not shown.
+    decisions_closed: list[int] = field(default_factory=list)
+    # 0.4.7 (z5): the background processes the loop waits for ({procs, since, session, session_key,
+    # platform}); the watchdog continues the loop when none of them runs any more or after the limit.
+    bg_wait: dict = field(default_factory=dict)
+    # 0.4.7 (z4): the boot id for which the restart line was shown (one time per restart).
+    restart_note_boot: str = ""
     last_model: str = ""
     # E1 A: the chat key that took over these goals (this state is then inactive), and the chat
     # key that this state took the goals from.
@@ -166,6 +173,9 @@ class GoalState:
             decisions_at_nudge=int(data.get("decisions_at_nudge", 0)),
             stop_hold=str(data.get("stop_hold", "")),
             decision_wait=bool(data.get("decision_wait", False)),
+            decisions_closed=[int(i) for i in data.get("decisions_closed", []) if str(i).isdigit()],
+            bg_wait=dict(data.get("bg_wait") or {}),
+            restart_note_boot=str(data.get("restart_note_boot", "")),
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),
@@ -181,6 +191,11 @@ class GoalState:
         """Goals the loop must still work on: not confirmed, not waiting, not blocked or paused."""
         return [g for g in self.goals
                 if not g.done and g.status not in OWNER_STATUSES and g.status != "waiting"]
+
+    def open_decisions(self) -> list[tuple[int, str]]:
+        """0.4.7 (z3): (number, text) of the decisions that no owner answer closed."""
+        closed = set(self.decisions_closed)
+        return [(i, t) for i, t in enumerate(self.decisions, start=1) if i not in closed]
 
     def unfinished(self) -> list[Goal]:
         return [g for g in self.goals if not g.done]
@@ -411,10 +426,10 @@ def status_block(state: GoalState, language: str = "en", go_question: bool = Fal
     lines = ["", "---", lab["title"]]
     for goal in state.goals:
         lines.append(_goal_line(goal, language))
-    if state.decisions:
+    if state.open_decisions():
         lines.append("")
         lines.append(lab["decisions"])
-        for index, decision in enumerate(state.decisions, start=1):
+        for index, decision in state.open_decisions():
             lines.append(f"{index}. {decision}")
     if go_question:
         lines.append("")
