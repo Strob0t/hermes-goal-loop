@@ -36,8 +36,9 @@ class LocalFollowUpTest(unittest.TestCase):
         tools, store, _, out = self.run_turn_end()
         self.assertEqual(len(goal_loop._CTX.sent), 1)
         self.assertTrue(goal_loop._CTX.sent[0].startswith(resume_run.PREFIX))
-        self.assertIn("g1", out)
+        self.assertIsNone(out)
         state = store.load(tools._load(LOCAL).chat_key)
+        self.assertIn("g1", state.display_note)
         self.assertEqual(state.resumes, 1)
         self.assertEqual(store.read_ledger(state.chat_key)[-1]["event"], "resume_injected")
 

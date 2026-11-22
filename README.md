@@ -13,8 +13,9 @@ patch the plugin's tools still work and the hook is simply never called.
 ## The five goals
 
 1. **Set goals and wait for the go.** `goal_set` records each goal with one falsifiable
-   check of the content, in the owner's language; the plugin shows the list and the go
-   question one time. `goal_go` records the go. No loop runs before the go. See **Go rule**.
+   check of the content, in the owner's language; the model shows the list and asks for the
+   go in the owner's language (see **Owner language**). `goal_go` records the go. No loop
+   runs before the go. See **Go rule**.
 2. **Run to the end.** The generic `pre_stop` hook keeps the turn going while open goals
    remain, bounded per turn by `agent.max_stop_continuations` (default 20) and per goal by
    `budget_per_goal` over all turns and runs. Idle turns and repeated judge rejections first
@@ -33,14 +34,25 @@ patch the plugin's tools still work and the hook is simply never called.
    recommendation); the chat shows the decisions as a numbered text list — no card, no
    modal.
 
+## Owner language (0.4.11)
+
+The plugin appends no text to the answer: `transform_llm_output` returns None. All plugin
+settings, prompts and tool texts are English. What the owner must see goes into
+`state.display_note` at the end of the turn; the next `pre_llm_call` gives it to the model as
+English context with the instruction: at the end of your answer, show this to the owner in the
+owner's language, in your own words; keep the goal ids and decision numbers. Each item goes into
+the context one time. While goals are set and the owner has not given the go, the context also
+tells the model to ask the owner for `go` in the owner's language; the `goal_set` tool answer says
+the same.
+
 ## What the chat shows
 
-The `transform_llm_output` hook appends a block to the final answer of a turn only when
-there is news for the owner:
+The model shows these items in the owner's language (context of the next turn, see
+**Owner language**), only when there is news for the owner:
 
-| Event in the turn | Block in the answer |
+| Event in the turn | Display for the owner |
 |---|---|
-| `goal_set` set the list (before the go) | the full list with each check and status, then the go question as the last line; the model does not repeat the list |
+| `goal_set` set the list (before the go) | the full list with each check and status, and the question for the go |
 | `goal_set` changed the list after the go (owner-approved) | the full list with each check and status |
 | after the go: a goal became blocked or paused, or a new owner decision, while another goal is actionable | nothing; the item goes into the deferred list (0.4.10) |
 | after the go: no goal is actionable any more | the deferred list (`Goal status (needs the owner):`, decisions with options, blocked goals with reason, the pending list change), each item one time |
@@ -49,10 +61,9 @@ there is news for the owner:
 | the judge confirmed the last goal | the full list with checkmarks, one time, with the final report |
 | after the final list, until a new `goal_set` | only a new owner decision, one time |
 
-The labels are English. Goal text, check and decision text stay as the model wrote them (in the
-owner's language, usage hint). Lines that explain the loop state (wait, pause, restart, follow-up
-run) are not appended to the answer: they go to the model as context, and the model writes them in
-the owner's language at the end of its answer.
+Goal text, check and decision text stay as the model wrote them (in the owner's language, usage
+hint). Lines that explain the loop state (wait, pause, restart, follow-up run) also go to the model
+as context, and the model writes them in the owner's language at the end of its answer.
 
 ## Owner messages (0.4.10)
 
@@ -76,9 +87,9 @@ the owner's language at the end of its answer.
 blocked or paused, waits for the owner. The other unfinished goals are actionable (a goal that waits
 for a background process or a delegation is actionable later). While a goal is actionable, a new
 decision, a `goal_block` and a refused `goal_set` change go into `state.deferred` (with time and
-text); the tool answer names the goals to continue with, the answer block does not show the items,
+text); the tool answer names the goals to continue with, the goal display does not show the items,
 and `pre_stop` continues, also after an answer with the stop cause `owner-question`. When no goal is
-actionable, the answer block shows the deferred list one time and the loop waits for the owner.
+actionable, the goal display shows the deferred list one time and the loop waits for the owner.
 
 ## Evidence (0.4.10)
 
@@ -94,9 +105,9 @@ an update does not repeat old items in a running chat.
 ## Show the list on request: `goal_status`
 
 `goal_status` returns the full list (each goal with its check and status, then the open
-decisions) as finished text. Its description tells the model to give this text to the
-owner unchanged, word for word. Ask the chat for the goal list; the model calls
-`goal_status` and passes the text through.
+decisions) as English text. Its description tells the model to show the result to the
+owner in the owner's language and keep each goal id. Ask the chat for the goal list; the
+model calls `goal_status` and shows the list.
 
 There is no `/goals` slash command. Hermes v0.23.2 has a plugin command API
 (`PluginContext.register_command`, `hermes_cli/plugins_context.py`), but on the path

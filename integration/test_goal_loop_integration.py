@@ -176,9 +176,9 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.go(**IDS)
         agent = SimpleNamespace(session_id="it-sess", model="m", platform="api_server")
         out, transformed, _ = apply_llm_output_transform(agent, "ANSWER", turn_id="t-resume")
-        self.assertTrue(transformed)
-        # 0.4.10 (R3): the follow-up-run line is a note for the model, not answer text
-        self.assertNotIn("follow-up run", out)
+        # 0.4.11: the plugin appends nothing; the follow-up-run line is a note for the model
+        self.assertFalse(transformed)
+        self.assertEqual(out, "ANSWER")
         state = self.tools.store.load(self.tools._load(IDS).chat_key)
         self.assertIn("follow-up run", state.loop_note)
         self.assertEqual(len(self.jobs), 1)
@@ -222,8 +222,8 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertIn("goal_id", claim.get("required", []))
         set_props = defs["goal_set"]["parameters"].get("properties", {})
         self.assertIn("goals", set_props)
-        # g4 b): the model reads the "give it unchanged" rule in goal_status's description
-        self.assertIn("unchanged", defs["goal_status"]["description"])
+        # 0.4.11: the model reads the owner-language rule in goal_status's description
+        self.assertIn("in the owner's language", defs["goal_status"]["description"])
 
     def test_tool_without_platform_and_hook_with_platform_share_state(self):
         # F2: the dispatcher passes tools session_id/conversation_id but NOT platform (#68318);
@@ -236,16 +236,17 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertTrue(verdict.continue_turn)              # the hook found the tool's state
         self.assertIn("g1", messages[-1]["content"])
 
-    def test_real_finalizer_keeps_model_text_and_appends_status(self):
-        # F6: the real fork caller passes the model answer as response_text; the status block must
-        # be appended, not substituted for the answer.
+    def test_real_finalizer_keeps_model_text_and_the_next_context_has_the_status(self):
+        # F6: the real fork caller passes the model answer as response_text; the answer stays as the
+        # model wrote it (0.4.11) and the status list goes to the next turn through pre_llm_call.
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         agent = SimpleNamespace(session_id="it-sess", model="m", platform="local")
         final, transformed, _ = apply_llm_output_transform(agent, "MODEL REPORT", turn_id="t1")
-        self.assertTrue(transformed)
-        self.assertIn("MODEL REPORT", final)
-        self.assertIn("Goal status:", final)
-        self.assertNotIn("(no final report from the model)", final)
+        self.assertFalse(transformed)
+        self.assertEqual(final, "MODEL REPORT")
+        context = owner_message("it-sess", "what is the plan?")
+        self.assertIn("Goal status:", context)
+        self.assertIn("in the owner's language", context)
 
     def test_state_survives_session_id_rotation_via_conversation_id(self):
         # F3: goals are set under session A with conversation root C; after a compaction the
@@ -262,15 +263,15 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
 
     def test_transform_survives_session_id_rotation_via_conversation_id(self):
         # F3 end to end on the transform side: the real finalizer hands conversation_id to the
-        # plugin hook, so the status block is appended even after the session id rotated.
+        # plugin hook, so the status list reaches the next context even after the session id rotated.
         self.tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                             session_id="A", conversation_id="C")
         agent = SimpleNamespace(session_id="B", model="m", platform="local",
                                  _inherited_conversation_id="C")
         final, transformed, _ = apply_llm_output_transform(agent, "MODEL REPORT R", turn_id="t9")
-        self.assertTrue(transformed)
-        self.assertIn("MODEL REPORT R", final)
-        self.assertIn("Goal status:", final)
+        self.assertFalse(transformed)
+        self.assertEqual(final, "MODEL REPORT R")
+        self.assertIn("Goal status:", owner_message("B", "and now?", conversation_root="C"))
 
     def test_judge_subagent_is_not_driven_by_the_parent_loop(self):
         # F7 through the REAL gate: the parent sets goals under conversation conv-P; a judge child
@@ -377,34 +378,34 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
 
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                   {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
-        final, transformed, _ = turn("HERE IS THE LIST")           # turn 0: goal_set
-        self.assertTrue(transformed)
-        self.assertIn("- [ ] g1: a", final)
-        owner_message("it-sess", "Go")
+
+        # 0.4.11: the answer stays unchanged; the display reaches the next turn through pre_llm_call
+        def unchanged(text):
+            final, transformed, _ = turn(text)
+            self.assertFalse(transformed)
+            self.assertEqual(final, text)
+
+        unchanged("HERE IS THE LIST")                               # turn 0: goal_set
+        self.assertIn("- [ ] g1: a", owner_message("it-sess", "Go"))
         self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
         tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **IDS)
-        final, transformed, _ = turn("PROGRESS")                    # progress only: no goal block
-        # 0.4.10 (R3): the turn ends while g2 is open; the follow-up-run line is a note for the model
-        self.assertFalse(transformed)
-        self.assertTrue(final.startswith("PROGRESS"))
-        self.assertNotIn("- [ ] g1: a", final)
+        unchanged("PROGRESS")                                       # progress only: no goal list
         state = tools.store.load(tools._load(IDS).chat_key)
+        self.assertEqual(state.display_note, "")
         self.assertIn("goal(s) open (g2)", state.loop_note)
         out = tools.goal_claim({"goal_id": "g2", "claim": {"summary": "s", **CHECKS}}, **IDS)
         self.assertIn("All goals are now confirmed", out)
-        final, transformed, _ = turn("FINAL REPORT")                # turn 1: all confirmed
-        self.assertTrue(transformed)
-        self.assertTrue(final.startswith("FINAL REPORT"))
-        self.assertIn("- [x] g1: a", final)
-        self.assertIn("- [x] g2: b", final)
-        final, transformed, _ = turn("LATER ANSWER")                # turn 2: nothing
-        self.assertFalse(transformed)
-        self.assertEqual(final, "LATER ANSWER")
+        unchanged("FINAL REPORT")                                   # turn 1: all confirmed
+        context = owner_message("it-sess", "go")
+        self.assertIn("- [x] g1: a", context)
+        self.assertIn("- [x] g2: b", context)
+        unchanged("LATER ANSWER")                                   # turn 2: nothing
+        self.assertNotIn("- [x] g1: a", owner_message("it-sess", "go") or "")
         tools.goal_set({"goals": [{"id": "n1", "text": "new goal", "check": "c"}]}, **IDS)
-        final, transformed, _ = turn("NEW LIST")                    # turn 3: new goal_set
-        self.assertTrue(transformed)
-        self.assertIn("- [ ] n1: new goal", final)
-        self.assertNotIn("g1: a", final)
+        unchanged("NEW LIST")                                       # turn 3: new goal_set
+        context = owner_message("it-sess", "go")
+        self.assertIn("- [ ] n1: new goal", context)
+        self.assertNotIn("g1: a", context)
 
     def test_go_rule_through_the_real_pre_llm_call_dispatch(self):
         # g5: goal_go directly after goal_set is refused; after an owner turn it is accepted.

@@ -142,6 +142,8 @@ class GoalState:
     decision_goals: dict = field(default_factory=dict)
     # 0.4.10 (z13): the loop state at the end of the last turn, for the next follow-up turn (context).
     loop_note: str = ""
+    # 0.4.11 (z14): what the last turn decided to show; the next turn gets it as context (one time).
+    display_note: str = ""
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -185,6 +187,7 @@ class GoalState:
             deferred=[dict(e) for e in data.get("deferred", []) if isinstance(e, dict)],
             decision_goals={str(k): str(v) for k, v in dict(data.get("decision_goals") or {}).items()},
             loop_note=str(data.get("loop_note", "")),
+            display_note=str(data.get("display_note", "")),
         )
 
     def goal(self, goal_id: str) -> Optional[Goal]:

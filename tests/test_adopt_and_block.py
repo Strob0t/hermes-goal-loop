@@ -3,9 +3,9 @@ new reason)."""
 import tempfile
 import unittest
 
-from goal_loop import _Tools, make_transform_llm_output
+from goal_loop import _Tools
 from goal_loop.state import Goal, GoalState, GoalStore
-from tests.test_v03 import IDS, Ctx, Settings, owner, set_and_go
+from tests.test_v03 import IDS, Ctx, Settings, owner, set_and_go, shown
 
 
 def store_with(parents):
@@ -97,7 +97,7 @@ class BlockShownOnceTest(unittest.TestCase):
         # 0.4.10 (R2): one goal only, so that its block is owner-bound and not deferred
         set_and_go(tools, store, goals=(("g1", "a", "c1"),))
         tools.goal_block({"goal_id": "g1", "reason": reason}, **IDS)
-        out = make_transform_llm_output(store, s)(response_text="Report.", **IDS)
+        out = shown(store, s, "Report.")
         return tools, store, s, out
 
     def test_the_first_block_is_shown(self):
@@ -111,7 +111,7 @@ class BlockShownOnceTest(unittest.TestCase):
                          **IDS)
         state = store.load(tools._load(IDS).chat_key)
         self.assertTrue(state.goal("g1").block_shown)
-        out = make_transform_llm_output(store, s)(response_text="Report two.", **IDS)
+        out = shown(store, s, "Report two.")
         self.assertNotIn("g1:", out or "")
         self.assertFalse(store.read_ledger(state.chat_key)[-1]["shown_again"])
 
@@ -121,7 +121,7 @@ class BlockShownOnceTest(unittest.TestCase):
         tools.goal_block({"goal_id": "g1", "reason": "GitHub token expired, push refused with 401"}, **IDS)
         state = store.load(tools._load(IDS).chat_key)
         self.assertFalse(state.goal("g1").block_shown)
-        out = make_transform_llm_output(store, s)(response_text="Report two.", **IDS)
+        out = shown(store, s, "Report two.")
         self.assertIn("g1:", out)
         self.assertIn("GitHub token expired", out)
 

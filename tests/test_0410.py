@@ -13,9 +13,11 @@ from goal_loop import GO_REFUSED, _chat_key, make_pre_llm_call, make_pre_stop, m
 try:
     from tests.test_043 import IDS, ledger_events, owner, set_and_go, setup, stop, tool
     from tests.test_047 import bg_modules
+    from tests.test_0411 import shown
 except ImportError:
     from test_043 import IDS, ledger_events, owner, set_and_go, setup, stop, tool
     from test_047 import bg_modules
+    from test_0411 import shown
 
 KEY = _chat_key("s1")
 EV = "ls -l /srv/app at 09:12, exit 0"
@@ -33,7 +35,8 @@ def running(goals=(("g1", "a", "c1"),), **settings):
 
 
 def answer(store, s, text="Interim report", platform="api_server"):
-    return make_transform_llm_output(store, s)(response_text=text, session_id="s1", platform=platform) or ""
+    """0.4.11: the goal display that the next turn gets as context (the answer stays unchanged)."""
+    return shown(store, s, text, platform=platform)
 
 
 def open_numbers(store):

@@ -2,8 +2,9 @@
 import tempfile
 import unittest
 
-from goal_loop import Settings, _Tools, _chat_key, make_pre_llm_call, make_transform_llm_output
+from goal_loop import Settings, _Tools, _chat_key, make_pre_llm_call
 from goal_loop.state import GoalStore
+from tests.test_0411 import shown
 
 CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
 
@@ -68,18 +69,22 @@ class DecisionAfterFinalListTest(unittest.TestCase):
     def test_decision_after_final_list(self):
         t, store = tools()
         ids = {"session_id": "s1", "conversation_id": "c1", "platform": "api_server"}
-        transform = make_transform_llm_output(store, Settings(overrides={"paused_hint": False}))
+        settings = Settings(overrides={"paused_hint": False})
+
+        def transform(response_text):
+            return shown(store, settings, response_text, **ids)
+
         t.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c"}]}, **ids)
-        transform(response_text="LIST", **ids)
+        transform("LIST")
         owner(store, "s1", conversation_id="c1")
         t.goal_go({}, **ids)
         t.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **ids)
-        self.assertIn("- [x] g1", transform(response_text="FINAL", **ids))
+        self.assertIn("- [x] g1", transform("FINAL"))
         t.goal_decision({"text": "Follow-up: A, B or C. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **ids)
-        out = transform(response_text="LATER", **ids)
+        out = transform("LATER")
         self.assertIn("Follow-up: A, B or C", out)
         self.assertNotIn("- [x] g1", out)
-        self.assertIsNone(transform(response_text="AGAIN", **ids))
+        self.assertEqual(transform("AGAIN"), "")
         self.assertTrue(store.load(_chat_key("c1")).final_shown)
 
 

@@ -2,12 +2,14 @@
 goal block shows the closed numbers once."""
 import unittest
 
-from goal_loop import _chat_key, make_transform_llm_output
+from goal_loop import _chat_key
 
 try:
     from tests.test_043 import EV, IDS, owner, set_and_go, setup, tool
+    from tests.test_0411 import shown
 except ImportError:
     from test_043 import EV, IDS, owner, set_and_go, setup, tool
+    from test_0411 import shown
 
 REAL_1800 = ("give me a clear list of all open points (you check the points against the actual state!), if "
              "points are still open give me at least 3 solution proposals for each with a best-practice "
@@ -20,7 +22,7 @@ def ready():
     tool(store)
     for i in range(1, 8):
         tools.goal_decision({"text": f"Question {i}: A/B/C", "evidence": EV}, **IDS)
-    make_transform_llm_output(store, s)(response_text="x", session_id="s1", platform="api_server")
+    shown(store, s, "x")
     return tools, store, s
 
 
@@ -29,7 +31,8 @@ def open_numbers(store):
 
 
 def block(store, s):
-    return make_transform_llm_output(store, s)(response_text="Status", session_id="s1", platform="api_server") or ""
+    """0.4.11: the goal display that the next turn gets as context (the answer stays unchanged)."""
+    return shown(store, s, "Status")
 
 
 class StrictCloseTest(unittest.TestCase):

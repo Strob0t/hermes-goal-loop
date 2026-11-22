@@ -11,10 +11,11 @@ import unittest
 from unittest.mock import patch
 
 from goal_loop import (
-    CHANGE_REFUSED, Settings, EXCLUDED_PLATFORMS, FINAL_REPORT_NUDGE, GO_REFUSED, GOAL_STATUS_DESCRIPTION, NO_REPORT_MARKER,
+    CHANGE_REFUSED, Settings, EXCLUDED_PLATFORMS, FINAL_REPORT_NUDGE, GO_REFUSED, GOAL_STATUS_DESCRIPTION,
     PROMPT_SECTION_ID, STOP_CAUSES, USAGE_HINT, _Tools, _chat_key, _state_dir, make_pre_llm_call,
     make_pre_stop, make_transform_llm_output, prompt_section, register,
 )
+from tests.test_0411 import shown
 from goal_loop.judge import JUDGE_TOOLSETS, run_judge
 from goal_loop.claim import ClaimError, serialize_completion_claim
 from goal_loop.state import Goal, GoalState, GoalStore, status_block
@@ -120,9 +121,9 @@ class Goal1BeforeWorkTest(unittest.TestCase):
             {"id": "g1", "text": "branch exists", "check": "git rev-parse g1"},
             {"id": "g2", "text": "tests pass", "check": "pytest -q"},
         ]}, **IDS)
-        # O1: the tool answer does not carry the list; the plugin appends it one time
+        # 0.4.11: the tool answer does not carry the list; the model shows it in the owner's language
         self.assertNotIn("git rev-parse g1", out)
-        self.assertIn("Do not repeat the list", out)
+        self.assertIn("in the owner's language", out)
         self.assertIn("No loop runs before goal_go", out)
         state = store.load(_chat_key("s1"))
         self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
@@ -265,28 +266,27 @@ class GoRuleTest(unittest.TestCase):
 
 
 class DisplayOnSetAndChangeTest(unittest.TestCase):
-    """g1: the status block appears exactly in a turn where goal_set set or changed the list."""
+    """g1: the status list goes into the context exactly after a turn where goal_set set or changed
+    the list (0.4.11: as context of the next turn, the answer stays unchanged)."""
 
     def setUp(self):
         self.tools, self.store, _ = make_tools("VERDICT: not-done the file is missing")
-        self.transform = make_transform_llm_output(self.store, QUIET)
 
     def answer(self, text="ANSWER"):
-        return self.transform(response_text=text, **IDS)
+        return shown(self.store, QUIET, text, **IDS)
 
     def test_first_set_shows_the_block(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
         out = self.answer()
-        self.assertTrue(out.startswith("ANSWER"))
         self.assertIn("Goal status:", out)
         self.assertIn("g1: a (check: c1)", out)
-        self.assertIsNone(self.answer())  # the next turn without a change shows nothing
+        self.assertEqual(self.answer(), "")  # the next turn without a change shows nothing
 
     def test_change_shows_the_block_again_also_after_the_go(self):
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
         self.answer()
         go(self.tools, self.store, **IDS)
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
         # L3: the first try is refused (deferred while g1 can be worked), then the owner approves the change
         self.assertIn("recorded in the deferred list",
                       self.tools.goal_set({"goals": [{"id": "g2", "text": "b", "check": "c2"}]}, **IDS))
@@ -302,32 +302,31 @@ class DisplayOnSetAndChangeTest(unittest.TestCase):
                                        {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
         self.answer()
         go(self.tools, self.store, **IDS)
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
         # in work and rejected by the judge
         self.assertIn("rejected", claim(self.tools, "g1", **IDS))
         self.assertEqual(self.store.load(_chat_key("s1")).goal("g1").status, "in_work")
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
         # done (one goal of two)
         self.tools.ctx.llm._text = "VERDICT: done"
         self.assertIn("confirmed", claim(self.tools, "g1", **IDS))
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
 
 
 class AfterGoOwnerItemsTest(unittest.TestCase):
-    """g2: after the go an answer shows only blocked goals and open owner decisions."""
+    """g2: after the go the display (context, 0.4.11) has only blocked goals and open owner decisions."""
 
     def setUp(self):
         self.tools, self.store, _ = make_tools("VERDICT: not-done no evidence")
         self.tools.settings = Settings(overrides={"block_min_rounds": 1})
-        self.transform = make_transform_llm_output(self.store, QUIET)
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                        {"id": "g2", "text": "b", "check": "c2"},
                                        {"id": "g3", "text": "c", "check": "c3"}]}, **IDS)
-        self.transform(response_text="LIST", **IDS)
+        self.answer("LIST")
         go(self.tools, self.store, **IDS)
 
     def answer(self, text="ANSWER"):
-        return self.transform(response_text=text, **IDS)
+        return shown(self.store, QUIET, text, **IDS)
 
     def test_a_blocked_goal_and_a_decision_appear(self):
         # 0.4.10 (R2): the owner items are shown when no goal can be worked
@@ -341,12 +340,12 @@ class AfterGoOwnerItemsTest(unittest.TestCase):
         self.assertIn("[blocked] — host down", out)
         self.assertIn("1. Name: A, B or C. Recommend A.", out)
         self.assertNotIn("g1: a", out)   # no progress lines
-        self.assertIsNone(self.answer())  # each owner item is shown one time
+        self.assertEqual(self.answer(), "")  # each owner item is shown one time
 
     def test_owner_items_wait_while_a_goal_can_be_worked(self):
         self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
         self.tools.goal_decision({"text": "Name: A, B or C. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
 
     def test_a_second_decision_shows_only_the_new_one_with_its_number(self):
         self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
@@ -362,11 +361,11 @@ class AfterGoOwnerItemsTest(unittest.TestCase):
         self.tools.ctx.llm._text = "VERDICT: done"
         claim(self.tools, "g1", **IDS)
         make_pre_stop(self.store)(session_id="s1", platform="api_server", attempt=0)
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
 
     def test_a_turn_with_only_a_judge_rejection_appends_nothing(self):
         self.assertIn("rejected", claim(self.tools, "g1", **IDS))
-        self.assertIsNone(self.answer())
+        self.assertEqual(self.answer(), "")
 
 
 class FinalListOnceTest(unittest.TestCase):
@@ -374,28 +373,31 @@ class FinalListOnceTest(unittest.TestCase):
 
     def test_final_list_once_then_nothing_until_a_new_goal_set(self):
         tools, store, _ = make_tools("VERDICT: done")
-        transform = make_transform_llm_output(store)
+        s = Settings()
+
+        def transform(response_text):
+            return shown(store, s, response_text, **IDS)
+
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                   {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
-        transform(response_text="LIST", **IDS)
+        transform("LIST")
         go(tools, store, **IDS)
         claim(tools, "g1", **IDS)
         self.assertIn(FINAL_REPORT_NUDGE.strip(), claim(tools, "g2", **IDS))
-        out = transform(response_text="FINAL REPORT", **IDS)
-        self.assertTrue(out.startswith("FINAL REPORT"))
+        out = transform("FINAL REPORT")
         self.assertIn("- [x] g1: a", out)
         self.assertIn("- [x] g2: b", out)
         self.assertTrue(store.load(_chat_key("s1")).final_shown)
-        self.assertIsNone(transform(response_text="later", **IDS))
+        self.assertEqual(transform("later"), "")
         # a decision after the final list still reaches the owner, one time
         tools.goal_decision({"text": "late pick: A or B", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
-        out = transform(response_text="AFTER", **IDS)
+        out = transform("AFTER")
         self.assertIn("needs the owner", out)
         self.assertIn("1. late pick: A or B", out)
         self.assertNotIn("g1: a", out)
-        self.assertIsNone(transform(response_text="again", **IDS))
+        self.assertEqual(transform("again"), "")
         tools.goal_set({"goals": [{"id": "n1", "text": "new", "check": "c"}]}, **IDS)
-        out = transform(response_text="NEW", **IDS)
+        out = transform("NEW")
         self.assertIn("- [ ] n1: new", out)
         self.assertNotIn("g1: a", out)
 
@@ -418,7 +420,7 @@ class FinalListOnceTest(unittest.TestCase):
         self.assertTrue(state.goal("g2").block_shown)    # the old blocked goal was shown already
         self.assertFalse(state.final_shown)              # not all done
         # the old state shows nothing new
-        self.assertIsNone(make_transform_llm_output(store)(response_text="x", session_id="s1"))
+        self.assertEqual(shown(store, Settings(), "x", platform=""), "")
         # an old, completely done state counts as shown
         old["goals"][1].update(status="done", done=True)
         with open(os.path.join(tmp, "chat_s1.json"), "w", encoding="utf-8") as handle:
@@ -449,9 +451,9 @@ class GoalStatusToolTest(unittest.TestCase):
         tools.goal_status({}, **IDS)
         self.assertTrue(store.load(_chat_key("s1")).list_changed)
 
-    def test_description_asks_for_the_text_unchanged(self):
-        self.assertIn("unchanged", GOAL_STATUS_DESCRIPTION)
-        self.assertIn("word for word", GOAL_STATUS_DESCRIPTION)
+    def test_description_asks_for_the_owner_language(self):
+        self.assertIn("show the result to the owner in the owner's language", GOAL_STATUS_DESCRIPTION)
+        self.assertIn("keep each goal id", GOAL_STATUS_DESCRIPTION)
 
 
 class UsageHintTest(unittest.TestCase):
@@ -499,11 +501,9 @@ class F3ConversationKeyTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]},
                        session_id="A", conversation_id="C")
-        transform = make_transform_llm_output(store)
         # without the conversation id the rotated session finds no state
-        self.assertIsNone(transform(response_text="REPORT", session_id="B"))
-        out = transform(response_text="REPORT", session_id="B", conversation_id="C")
-        self.assertIn("REPORT", out)
+        self.assertEqual(shown(store, Settings(), "REPORT", session_id="B", platform=""), "")
+        out = shown(store, Settings(), "REPORT", session_id="B", platform="", conversation_id="C")
         self.assertIn("Goal status:", out)
 
 
@@ -583,23 +583,20 @@ class F5FinalReportTest(unittest.TestCase):
         self.assertIn("confirmed by the judge", out)
         self.assertNotIn(FINAL_REPORT_NUDGE.strip(), out)  # g2 still open
 
-    def test_transform_marks_an_empty_final_turn(self):
+    def test_an_empty_final_turn_keeps_the_display_for_the_next_turn(self):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
-        transform = make_transform_llm_output(store)
-        # the live field is response_text; empty response_text -> the marker shows
-        out = transform(response_text="   ", session_id="s1", platform="api_server")
-        self.assertIn(NO_REPORT_MARKER, out)
+        # 0.4.11: no marker text; the answer stays as it is and the list goes into the next context
+        out = shown(store, Settings(), "   ", session_id="s1", platform="api_server")
+        self.assertIn("g1: x", out)
 
     def test_transform_keeps_the_models_real_answer(self):
         # F6: the model's text arrives as response_text and must be preserved, not overwritten
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         transform = make_transform_llm_output(store)
-        out = transform(response_text="REPORT: g1 done", session_id="s1", platform="api_server")
-        self.assertTrue(out.startswith("REPORT: g1 done"))
-        self.assertIn("Goal status:", out)
-        self.assertNotIn(NO_REPORT_MARKER, out)
+        self.assertIsNone(transform(response_text="REPORT: g1 done", session_id="s1", platform="api_server"))
+        self.assertIn("Goal status:", store.load(_chat_key("s1")).display_note)
 
 
 class F4JudgeToolsetTest(unittest.TestCase):
@@ -657,9 +654,9 @@ class F7SubagentExclusionTest(unittest.TestCase):
         # the judge's own answer is a VERDICT line; it must pass through untouched (None = no change)
         self.assertIsNone(transform(response_text="VERDICT: done", platform="subagent",
                                     conversation_id="conv-P"))
-        # a local answer in the same conversation still gets the status block
-        out = transform(response_text="REPORT", platform="local", conversation_id="conv-P")
-        self.assertIn("REPORT", out)
+        self.assertEqual(store.load(_chat_key("conv-P")).display_note, "")
+        # a local answer in the same conversation still gets the status list (context, 0.4.11)
+        out = shown(store, Settings(), "REPORT", session_id="", platform="local", conversation_id="conv-P")
         self.assertIn("Goal status:", out)
 
 
@@ -738,9 +735,9 @@ class Goal4DoneStaysDoneTest(unittest.TestCase):
         tools.goal_set({"goals": [
             {"id": "g1", "text": "a", "check": "c1"}, {"id": "g2", "text": "b", "check": "c2"},
         ]}, **IDS)
-        transform = make_transform_llm_output(store)
-        out = transform(text="here is my answer", session_id="s1", platform="api_server")
-        self.assertIn("here is my answer", out)
+        self.assertIsNone(make_transform_llm_output(store)(text="here is my answer", session_id="s1",
+                                                           platform="api_server"))
+        out = store.load(_chat_key("s1")).display_note
         self.assertIn("g1: a", out)
         self.assertIn("g2: b", out)
         self.assertIn("Goal status:", out)

@@ -1,5 +1,12 @@
 """hermes-goal-loop: a goal loop for Hermes as a plugin (v0.3).
 
+0.4.11 (z14): owner language. The plugin appends no text to the answer (``transform_llm_output``
+returns None). What the owner must see (the goal list after ``goal_set``, goals that need the owner,
+open decisions, the deferred list, the numbers just closed, the final list), each one time, goes into
+``state.display_note``; the next ``pre_llm_call`` gives it to the model as English context, and the
+model shows it at the end of its answer in the owner's language. Before the go the context tells the
+model to ask the owner for 'go'. All plugin settings, prompts and tool texts stay English.
+
 0.4.10 (z13): three owner rules.
 R1 Pause: each owner message pauses the loop (go False, a pending follow-up run is cancelled, the
    background and owner waits are cleared, ledger ``paused_by_owner_message``). Only a message with the
@@ -13,9 +20,9 @@ R2 Deferred list: ``goal_decision`` takes an optional ``goal_id``. A goal with a
    or with status blocked or paused, waits for the owner; the other unfinished goals are actionable
    (a goal that waits for a background process or a delegation is actionable later). While a goal is
    actionable, a new decision, a ``goal_block`` and a refused ``goal_set`` change go into
-   ``state.deferred``; the answer block does not show them and the loop continues with the actionable
+   ``state.deferred``; the goal display does not show them and the loop continues with the actionable
    goals (also after an answer with the stop cause owner-question). When no goal is actionable, the
-   answer block shows the deferred list one time and the loop waits for the owner.
+   goal display shows the deferred list one time and the loop waits for the owner.
 R3 English only: all plugin texts are English. Lines that explain the loop state (wait, pause,
    restart, follow-up run) go to the model as context, and the model writes them in the owner's
    language at the end of its answer. ``scripts/check_english.py`` checks the tracked files.
@@ -37,12 +44,11 @@ writes one INFO line with its nonce and job id.
 0.4.5 (r32): the stop-cause line of an answer (done, owner-question, blocker) holds the loop until
 the next owner message.
 
-1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check. The
-   plugin appends the goal list and the go question to the answer of that turn (one time; the model
-   does not repeat the list). No loop runs before ``goal_go``. **Go rule:** ``goal_go`` is accepted
-   only when an owner message with the word 'go' came into the chat after the last ``goal_set`` or
-   pause of the session. The ``pre_llm_call`` hook counts these messages (gateway notifications,
-   subagent and cron turns do not count).
+1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check, shows
+   the list to the owner in the owner's language and asks for 'go'. No loop runs before
+   ``goal_go``. **Go rule:** ``goal_go`` is accepted only when an owner message with the word 'go'
+   came into the chat after the last ``goal_set`` or pause of the session. The ``pre_llm_call``
+   hook counts these messages (gateway notifications, subagent and cron turns do not count).
 2. To the end: a generic ``pre_stop`` hook (companion fork patch) keeps the turn going while open
    goals remain. Limits (all in ``plugins.entries.goal-loop.settings``):
 
@@ -62,10 +68,9 @@ the next owner message.
 4. Context: each owner turn with an active go gets the open goals (text, check, progress) as context
    (``pre_llm_call``), so a compression cannot remove them. ``goal_progress`` records the last step,
    its evidence and the next step of a goal.
-5. Status, shown quietly (``transform_llm_output``): the full list on ``goal_set`` (with the go
-   question as last line before the go), after that only goals that need the owner and new
-   decisions, each one time, and the final list one time. The labels are English; goal and decision
-   texts stay as the model wrote them.
+5. Status, shown quietly (0.4.11: as context for the model, see above): the full list on
+   ``goal_set``, after that only goals that need the owner and new decisions, each one time, and the
+   final list one time. ``goal_status`` returns the full English list.
 6. Changes after the go: ``goal_set`` is refused until an owner message approves the change;
    then the judge-confirmed goals stay done.
 
@@ -278,8 +283,9 @@ USAGE_HINT = (
     "examines the content (evidence with a source, a real run, a value), not only the form (a "
     "file exists, a section count); (2) the judge must be able to examine the check when you "
     "submit the claim, so no check on a later chat report; (3) name the version that runs live as "
-    "the base. Split a large goal into smaller goals. The plugin appends the goal list and the go "
-    "question to your answer: do not repeat the list and do not ask for the go yourself. Call "
+    "the base. Split a large goal into smaller goals. The plugin appends nothing to your answer: "
+    "when the plugin context gives a goal display or asks for the go, show it to the owner at the "
+    "end of your answer in the owner's language, in your own words. Call "
     "goal_go only after the owner wrote 'go' in a new message. Each other owner message pauses the "
     "loop: answer it and ask for 'go'. Record progress with goal_progress. If a goal needs the owner, "
     "record a goal_decision with its goal_id and continue with the other goals. " + EVIDENCE_RULE
@@ -287,7 +293,8 @@ USAGE_HINT = (
 
 GO_REFUSED = (
     "error: goal_go refused: no owner message with the word 'go' came after the last goal_set or "
-    "pause. End your turn; the plugin shows the goal list and the go question. Call goal_go only in "
+    "pause. Show the goal list to the owner in the owner's language, ask for 'go' and end your turn. "
+    "Call goal_go only in "
     "the turn that answers the owner's go. The loop does not start."
 )
 
@@ -304,13 +311,11 @@ CHANGE_DEFERRED = (
 )
 
 GOAL_STATUS_DESCRIPTION = (
-    "Return the goal list with each goal's check and status as finished text. Give the returned "
-    "text to the owner unchanged, word for word: do not summarize, shorten, reorder or reformat it."
+    "Return the goal list with each goal's check and status; show the result to the owner in the "
+    "owner's language and keep each goal id."
 )
 
 PROMPT_SECTION_ID = "goal-loop"
-# Shown before the block when the model turn is empty.
-NO_REPORT_MARKER = LABELS["no_report"]
 
 _INTERNAL_FOOTER_PREFIX = "[INTERNAL NOTIFICATION"
 _STEER_DISPLAY_KIND = "steer"
@@ -670,12 +675,12 @@ class _Tools:
                                  count=len(goals))
         self.store.save(state)
         if change:
-            return ("Goal list changed with the owner's approval; confirmed goals stay done. The "
-                    "plugin appends the new list to your answer. Continue the work.")
-        return ("Goals recorded. The plugin appends the goal list and the go question to your "
-                "answer of this turn. Do not repeat the list and do not ask for the go: write at "
-                "most a short summary in the owner's language, then end your turn. No loop runs "
-                "before goal_go.")
+            return ("Goal list changed with the owner's approval; confirmed goals stay done. At the end "
+                    "of your answer, show the new list to the owner in the owner's language (keep the "
+                    "goal ids). Continue the work.")
+        return ("Goals recorded. At the end of your answer, show the goal list (each goal with its id "
+                "and check) to the owner in the owner's language, in your own words, and ask the owner "
+                "to write 'go' to start the loop. Then end your turn. No loop runs before goal_go.")
 
     def goal_go(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self._load(kwargs)
@@ -1325,13 +1330,14 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
 # --- The status display (transform_llm_output) -------------------------------------------------
 
 def _display_block(state: GoalState) -> str:
-    """Decide what this turn's answer shows and record it as shown (the caller saves the state).
+    """Decide what the owner must see after this turn and record it as shown (the caller saves the
+    state and gives it to the model as context, 0.4.11). The go question is a separate note (GO_ASK).
     0.4.10 (R2): deferred items stay hidden while a goal can be worked; when none can, they are shown
     one time."""
     if state.list_changed:
         state.mark_all_shown()
         state.final_shown = state.all_done()
-        return status_block(state, go_question=not state.go)
+        return status_block(state)
     if state.all_done():
         if not state.final_shown:
             state.final_shown = True
@@ -1448,7 +1454,9 @@ def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
 
 
 def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = None):
-    """Append the goal display to the final answer of a turn, only when there is news."""
+    """At the end of a turn: record the turn end, the stop cause, the waits and the follow-up run, and
+    store what the owner must see (``state.display_note``) for the context of the next turn. The
+    answer stays unchanged (0.4.11)."""
     settings = settings or Settings()
 
     def _transform(response_text: str = "", text: str = "", session_id: str = "",
@@ -1472,7 +1480,9 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             _pause(store, state, waiting, f"{state.resumes} follow-up runs without completion",
                    DECISION_TEXT["resume_max"].format(n=state.resumes, gids=_ids(waiting)), state.chat_key,
                    "paused_resume_max")
-        block = _display_block(state)
+        block = _display_block(state).lstrip("\n-")
+        if block:
+            state.display_note = state.display_note + "\n\n" + block if state.display_note else block
         # L15: the turn ends while goals are still open after the go. L13: a state that a
         # different process drove is held after a restart, so it gets no follow-up run either.
         held = bool(state.boot_id) and state.boot_id != BOOT_ID
@@ -1498,7 +1508,8 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             note = LOOP_NOTES["inject"].format(n=n, gids=gids)
         elif open_goals and settings.get("paused_hint"):
             note = LOOP_NOTES["paused"].format(n=n, gids=gids)
-        # 0.4.10 (R3): the loop state goes to the model as context of the next turn, not into this answer.
+        # 0.4.10 (R3) and 0.4.11 (z14): the loop state and the display go to the model as context of
+        # the next turn; the plugin appends nothing to this answer.
         changed = bool(block or open_goals) or note != state.loop_note
         state.loop_note = note
         if changed:
@@ -1506,58 +1517,9 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
                 store.save(state)
             except Exception:
                 logger.debug("goal display state save failed", exc_info=True)
-        if not block:
-            return None
-        # One goal block per answer: the model imitates the stored plugin blocks of earlier turns.
-        body = strip_model_blocks(body, go_question=_GO_LINE.search(block) is not None)
-        if not body.strip():
-            body = LABELS["no_report"]
-        return body + "\n" + block
+        return None
 
     return _transform
-
-
-# Lines of a goal block that the model wrote itself (labels of state.LABELS).
-_TITLE_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(re.escape(LABELS[key]) for key in ("title", "title_owner")))
-_DECISIONS_LINE = re.compile(r"^\s*(%s)\s*$" % re.escape(LABELS["decisions"]))
-_GOAL_LINE = re.compile(r"^\s*- \[[ xX]\] \S+:")
-_NUMBERED_LINE = re.compile(r"^\s*\d+\.\s")
-_GO_LINE = re.compile(r"^\s*(%s|Reply \W?go\W? to start\.?)\s*$" % re.escape(LABELS["go_question"]),
-                      re.IGNORECASE | re.MULTILINE)
-
-
-def strip_model_blocks(body: str, go_question: bool = False) -> str:
-    """Remove goal blocks that the model wrote into its own text: a title line of a plugin label,
-    then goal lines, a decisions heading with numbered lines, go lines and blank lines; the ``---``
-    line before the title goes too. With ``go_question`` (the plugin block asks for the go), also
-    remove go lines elsewhere, so that the go question is the last line of the answer, one time."""
-    lines = body.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        if _TITLE_LINE.match(lines[i]):
-            while out and not out[-1].strip():
-                out.pop()
-            if out and out[-1].strip() == "---":
-                out.pop()
-            i += 1
-            in_decisions = False
-            while i < len(lines):
-                line = lines[i]
-                if _DECISIONS_LINE.match(line):
-                    in_decisions = True
-                elif not (not line.strip() or _GOAL_LINE.match(line) or _GO_LINE.fullmatch(line)
-                          or (in_decisions and _NUMBERED_LINE.match(line))):
-                    break
-                i += 1
-            continue
-        if go_question and _GO_LINE.fullmatch(lines[i]):
-            i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    text = "\n".join(out)
-    return re.sub(r"\n{3,}", "\n\n", text).rstrip()
 
 
 # --- The go gate, the owner pause and the goal context (pre_llm_call) -------------------------
@@ -1700,6 +1662,25 @@ LOOP_HINT = ("[goal-loop] At the end of your answer, write one short line in the
              "goes on by itself while goals are open, and any owner message without 'go' pauses it.")
 
 
+DISPLAY_LEAD = ("[goal-loop] Goal display for the owner. At the end of your answer, show this to the owner in "
+                "the owner's language, in your own words; keep the goal ids and decision numbers.")
+GO_ASK = ("[goal-loop] The goals are set and the owner has not given the go. At the end of your answer, ask "
+          "the owner to write 'go' to start the loop; write this in the owner's language. Do not call "
+          "goal_go before the owner writes 'go'.")
+
+
+def _with_display(store: GoalStore, state: GoalState, context: str, ask_go: bool = False) -> Optional[str]:
+    """0.4.11 (z14): add the stored goal display (one time) and the go question to the context."""
+    parts = [context] if context else []
+    if state.display_note:
+        parts.append(DISPLAY_LEAD + "\n" + state.display_note)
+        state.display_note = ""
+        store.save(state)
+    if ask_go and state.goals and not state.go and not state.owner_paused and state.unfinished():
+        parts.append(GO_ASK)
+    return "\n\n".join(parts) or None
+
+
 def _restart_note(store: GoalStore, state: GoalState) -> str:
     """0.4.7 (z4): the first turn after a restart that finds the loop held gets the restart note."""
     held = bool(state.boot_id) and state.boot_id != BOOT_ID
@@ -1745,7 +1726,8 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                         context = _goals_context(state) + "\n\n" + LOOP_HINT
                         if state.loop_note:
                             context += "\n" + _LOOP_NOTE_LEAD + state.loop_note
-                        return context + _restart_note(store, state)
+                        return _with_display(store, state, context + _restart_note(store, state))
+                    return _with_display(store, state, "")
                 return None
             if not _is_owner_message(user_message, conversation_history):
                 return None
@@ -1781,16 +1763,16 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                         store.append_ledger(state.chat_key, "resumed_by_owner_go",
                                             open=[g.id for g in state.unfinished()])
                 store.save(state)
-                if state.go and state.unfinished():
-                    return _goals_context(state) + "\n\n" + LOOP_HINT
-                return None
+                context = _goals_context(state) + "\n\n" + LOOP_HINT if state.go and state.unfinished() else ""
+                return _with_display(store, state, context)
             if state.go and state.unfinished():
                 _pause_by_owner(store, state, gate)  # 0.4.10 (R1)
-                return (_goals_context(state) + "\n\n" + PAUSE_NOTE.format(
+                return _with_display(store, state, _goals_context(state) + "\n\n" + PAUSE_NOTE.format(
                     n=len(state.unfinished()), gids=_ids(state.unfinished())) + " " + EVIDENCE_RULE)
             if not state.decision_wait:
                 state.decisions_at_nudge = len(state.decisions)
             store.save(state)
+            return _with_display(store, state, "", ask_go=True)
         except Exception:
             logger.debug("goal-loop pre_llm_call failed", exc_info=True)
         return None
@@ -1974,7 +1956,8 @@ def register(ctx) -> None:
     specs = (
         ("goal_set", _GOAL_SET_SCHEMA, tools.goal_set, "🎯",
          ("Record the goals, each with one falsifiable check of the content, in the owner's language. "
-          "Call before any goal work. The plugin shows the list and the go question.")),
+          "Call before any goal work. Then show the list to the owner in the owner's language and ask "
+          "for 'go'.")),
         ("goal_go", _EMPTY_SCHEMA, tools.goal_go, "🟢",
          ("Record the owner's go (also to resume paused goals). Call it only after the owner wrote "
           "'go' in a new message; otherwise it is refused.")),

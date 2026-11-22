@@ -1,11 +1,10 @@
-"""Tests of the one-block rule (goals d1-d3): the answer has at most one goal block, the plugin
-block, and the go question is the last line, one time."""
+"""Tests of the one-block rule (goals d1-d3), 0.4.11: the plugin appends no block, the next context has
+one goal list and the go question one time, and the model answer stays unchanged."""
 import unittest
 
-from goal_loop import make_transform_llm_output, strip_model_blocks
+from goal_loop import GO_ASK, make_transform_llm_output
 from tests.test_v03 import IDS, owner, setup
 
-GO_QUESTION = "Do you give the go?"
 MODEL_BLOCKS = (
     "I changed the plan.\n\n"
     "---\nGoal status (needs the owner):\n"
@@ -24,52 +23,40 @@ class OneBlockTest(unittest.TestCase):
         owner(store, "Please check this and then write me a report on how it runs", settings=s)
         return tools.goal_set({"goals": [{"id": g, "text": t, "check": c} for g, t, c in goals]}, **IDS)
 
-    def test_two_goal_set_in_one_turn_give_one_block(self):
+    def test_two_goal_set_in_one_turn_give_one_list_in_the_context(self):
         tools, store, _, s = setup()
         self._goal_set(tools, store, s, [("t1", "goal one", "P1")])
         tools.goal_set({"goals": [{"id": "t1", "text": "goal one", "check": "P1"},
                                   {"id": "t2", "text": "goal two", "check": "P2"}]}, **IDS)
-        answer = make_transform_llm_output(store, s)(response_text="Two calls.", **IDS)
-        self.assertEqual(answer.count("Goal status:"), 1)
-        self.assertEqual(answer.count("t1:"), 1)
-        self.assertEqual(answer.count("t2:"), 1)
-        self.assertEqual(answer.count(GO_QUESTION), 1)
-        self.assertTrue(answer.rstrip().endswith(GO_QUESTION))
+        self.assertIsNone(make_transform_llm_output(store, s)(response_text="Two calls.", **IDS))
+        context = owner(store, "and now?", settings=s)
+        self.assertEqual(context.count("Goal status:"), 1)
+        self.assertEqual(context.count("t1:"), 1)
+        self.assertEqual(context.count("t2:"), 1)
+        self.assertEqual(context.count(GO_ASK), 1)
 
-    def test_model_written_blocks_are_removed(self):
+    def test_model_written_blocks_stay_and_the_context_has_the_plugin_list(self):
         tools, store, _, s = setup()
         self._goal_set(tools, store, s, [("s0", "the plugin goal", "the plugin check")])
-        answer = make_transform_llm_output(store, s)(response_text=MODEL_BLOCKS, **IDS)
-        self.assertNotIn("needs the owner", answer)
-        self.assertNotIn("Reply \"go\"", answer)
-        self.assertNotIn("precheck", answer)
-        self.assertNotIn("Option A or B", answer)
-        self.assertEqual(answer.count("Goal status:"), 1)
-        self.assertEqual(answer.count("s0:"), 1)
-        self.assertIn("s0: the plugin goal", answer)
-        self.assertTrue(answer.startswith("I changed the plan."))
-        self.assertTrue(answer.rstrip().endswith(GO_QUESTION))
-        self.assertEqual(answer.count(GO_QUESTION), 1)
+        self.assertIsNone(make_transform_llm_output(store, s)(response_text=MODEL_BLOCKS, **IDS))
+        context = owner(store, "ok?", settings=s)
+        self.assertIn("s0: the plugin goal", context)
+        self.assertNotIn("precheck", context)
+        self.assertNotIn("Option A or B", context)
 
-    def test_answer_ends_with_the_go_question_once(self):
+    def test_the_go_question_goes_into_the_context_once_per_turn(self):
         tools, store, _, s = setup()
         self._goal_set(tools, store, s, [("g1", "goal", "P")])
         body = "Do you give the go?\nThe plan in short.\nDo you give the go?"
-        answer = make_transform_llm_output(store, s)(response_text=body, **IDS)
-        self.assertEqual(answer.count(GO_QUESTION), 1)
-        self.assertTrue(answer.rstrip().endswith(GO_QUESTION))
-        self.assertIn("The plan in short.", answer)
-
-    def test_text_without_a_block_is_kept(self):
-        text = "First paragraph.\n\n---\n\nSecond paragraph with - [ ] a list.\n1. Item"
-        self.assertEqual(strip_model_blocks(text), text)
-        self.assertEqual(strip_model_blocks(text, go_question=True), text)
+        self.assertIsNone(make_transform_llm_output(store, s)(response_text=body, **IDS))
+        self.assertEqual(owner(store, "why?", settings=s).count(GO_ASK), 1)
+        self.assertEqual(owner(store, "and?", settings=s), GO_ASK)
 
     def test_no_plugin_block_keeps_the_body(self):
         tools, store, _, s = setup()
         self._goal_set(tools, store, s, [("g1", "goal", "P")])
         make_transform_llm_output(store, s)(response_text="first answer", **IDS)
-        # nothing new to show: the plugin returns None and leaves the model text unchanged
+        # the plugin returns None and leaves the model text unchanged
         self.assertIsNone(make_transform_llm_output(store, s)(response_text=MODEL_BLOCKS, **IDS))
 
 

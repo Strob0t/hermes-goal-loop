@@ -11,6 +11,11 @@ import goal_loop
 from goal_loop.judge import JUDGE_TASK, run_judge
 from goal_loop.state import GoalStore
 
+try:
+    from tests.test_0411 import shown
+except ImportError:
+    from test_0411 import shown
+
 IDS = {"session_id": "s1", "platform": "api_server"}
 CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
 
@@ -410,27 +415,28 @@ class L17RejectTest(unittest.TestCase):
 
 
 class O1O2OutputTest(unittest.TestCase):
-    def test_goal_set_reply_has_no_list_and_the_block_has_the_go_question_once(self):
+    def test_goal_set_reply_has_no_list_and_the_context_has_the_list_and_the_go_question_once(self):
         tools, store, _, s = setup()
         out = tools.goal_set({"goals": [{"id": "g1", "text": "goal one", "check": "check one"}]}, **IDS)
         self.assertNotIn("goal one", out)
-        answer = make_transform_llm_output(store, s)(response_text="Short: one goal.", **IDS)
-        self.assertEqual(answer.count("g1:"), 1)
-        self.assertTrue(answer.rstrip().endswith("Do you give the go?"))
+        self.assertIsNone(make_transform_llm_output(store, s)(response_text="Short: one goal.", **IDS))
+        context = owner(store, "what is g1?", settings=s)
+        self.assertEqual(context.count("g1:"), 1)
+        self.assertEqual(context.count(goal_loop.GO_ASK), 1)
 
     def test_labels_are_english(self):
         tools, store, _, s = setup()
         tools.goal_set({"goals": [{"id": "g1", "text": "goal", "check": "a check"}]}, **IDS)
-        answer = make_transform_llm_output(store, s)(response_text="Short.", **IDS)
-        self.assertIn("Goal status:", answer)
-        self.assertIn("(check: a check) [open]", answer)
+        context = shown(store, s, "Short.")
+        self.assertIn("Goal status:", context)
+        self.assertIn("(check: a check) [open]", context)
 
 
 class O3O5HintTest(unittest.TestCase):
     def test_usage_hint_has_the_check_rules(self):
         for text in ("examines the content", "at claim time".replace("at claim time", "when you"),
                      "no check on a later chat report", "version that runs live",
-                     "do not ask for the go yourself", "language that the owner mostly uses"):
+                     "appends nothing to your answer", "language that the owner mostly uses"):
             self.assertIn(text, USAGE_HINT)
 
 

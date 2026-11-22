@@ -46,7 +46,12 @@ def ready(**settings):
 
 
 def block_text(store, s, platform="api_server"):
-    return make_transform_llm_output(store, s)(response_text="Interim report", session_id="s1", platform=platform) or ""
+    """0.4.11: the goal display that the next turn gets as context (the answer stays unchanged)."""
+    try:
+        from tests.test_0411 import shown
+    except ImportError:
+        from test_0411 import shown
+    return shown(store, s, "Interim report", platform=platform)
 
 
 class DecisionsByNumberTest(unittest.TestCase):
