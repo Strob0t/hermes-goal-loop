@@ -144,6 +144,10 @@ class GoalState:
     loop_note: str = ""
     # 0.4.11 (z14): what the last turn decided to show; the next turn gets it as context (one time).
     display_note: str = ""
+    # 0.4.13 (z19): a goal_progress with a new step, a goal_claim or a new goal_decision came in this
+    # round; and the rounds in a row without progress in which every open goal waited for the owner.
+    round_progress: bool = False
+    owner_wait_rounds: int = 0
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -188,6 +192,8 @@ class GoalState:
             decision_goals={str(k): str(v) for k, v in dict(data.get("decision_goals") or {}).items()},
             loop_note=str(data.get("loop_note", "")),
             display_note=str(data.get("display_note", "")),
+            round_progress=bool(data.get("round_progress", False)),
+            owner_wait_rounds=int(data.get("owner_wait_rounds", 0)),
         )
 
     def goal(self, goal_id: str) -> Optional[Goal]:
@@ -371,9 +377,21 @@ class GoalStore:
         self._write_atomic(self._side_path(kind, session_id), json.dumps(data, ensure_ascii=False))
 
     # go gate (kind "gate") and change gate (kind "change")
-    def open_gate(self, session_id: str, kind: str = "gate") -> None:
-        """No owner message has come after this point yet."""
-        self._write_side(kind, session_id, {"session_id": session_id, "owner_messages": 0})
+    def open_gate(self, session_id: str, kind: str = "gate", turn_go: bool = False) -> None:
+        """No owner message has come after this point yet. 0.4.13 (z18): ``turn_go`` records that the
+        owner message of the running turn had a go (a goal_set of a fresh list in that turn)."""
+        data = {"session_id": session_id, "owner_messages": 0}
+        if turn_go:
+            data["turn_go"] = True
+        self._write_side(kind, session_id, data)
+
+    def gate_turn_go(self, session_id: str, kind: str = "gate") -> bool:
+        return bool((self._read_side(kind, session_id) or {}).get("turn_go"))
+
+    def drop_turn_go(self, session_id: str, kind: str = "gate") -> None:
+        data = self._read_side(kind, session_id)
+        if data and data.pop("turn_go", None):
+            self._write_side(kind, session_id, data)
 
     def gate_count(self, session_id: str, kind: str = "gate") -> Optional[int]:
         """Owner messages since the gate opened, or None without a gate."""

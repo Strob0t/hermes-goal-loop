@@ -1,5 +1,20 @@
 """hermes-goal-loop: a goal loop for Hermes as a plugin (v0.3).
 
+0.4.13 (z18, z19): three rules.
+S1 Steer row: an owner message that interrupts a running turn comes as its own user row with
+   ``display_kind`` "steer" and the marker ``[OUT-OF-BAND USER MESSAGE``. ``pre_api_request`` counts it
+   one time like a redirect row (pause without 'go', go with 'go'); the marker lines are removed before
+   the go detection.
+S2 Owner-only rounds: ``_similar`` compares against the smaller word set, so a reworded reason is the
+   same obstacle. When a round had no progress (no new ``goal_progress`` step, no ``goal_claim``, no
+   new ``goal_decision``) and only the owner can move the open goals (each one got a ``goal_block``, or
+   a refused list change waits), ``pre_stop`` counts it (``owner_wait_rounds``); after 2 such rounds the
+   loop waits (``waiting_owner``) and shows the deferred list. Progress, an owner message and a go reset
+   the count.
+S3 Turn go: an owner message with 'go' writes the side file ``turngo``; a ``goal_set`` of a fresh list in
+   the same turn keeps that go in the new go gate, so ``goal_go`` accepts it one time. The turn end, an
+   owner message without 'go' and a follow-up run remove it. A changed list still needs a later message.
+
 0.4.12 (z15): background watchdog. A tool call creates the turn mark when it is absent (a turn that
 started before a plugin reload), so the watchdog does not continue a chat while that turn runs. A wait
 for a process id that is not stored starts a new wait (only the awaited ids, a new start time); the
@@ -336,6 +351,15 @@ _TASK_LIST_RESTORE_PREFIX = "[Your active task list was preserved across context
 # 0.4.4: an owner message that interrupts a running turn (agent.redirect) does not start a new turn,
 # so pre_llm_call does not see it; Hermes appends it as a user row with this api_content prefix.
 _REDIRECT_PREFIX = "[Context from the interrupted assistant response]"
+# 0.4.13 (z18): Hermes v0.23.3 delivers such a message as its own user row (display_kind "steer") with
+# this marker before and after the text (agent/prompt_builder.py STEER_MARKER_OPEN, STEER_MARKER_CLOSE).
+_STEER_MARKER = "[OUT-OF-BAND USER MESSAGE"
+_STEER_MARKER_LINE = re.compile(r"^[ \t]*\[/?OUT-OF-BAND USER MESSAGE[^\n]*$", re.MULTILINE)
+# 0.4.13 (z19): rounds in a row without progress in which only the owner can move a goal.
+OWNER_WAIT_ROUNDS = 2
+# 0.4.13 (z18): side file of the running turn whose owner message had a go ('list ok go'); the turn
+# end, an owner message without go and a follow-up run remove it.
+_TURN_GO = "turngo"
 
 # L12: tools a judge child may call, and terminal commands it must not run.
 _JUDGE_ALLOWED_TOOLS = frozenset({"read_file", "search_files", "terminal"})
@@ -383,12 +407,13 @@ def _gate_for(store: "GoalStore", session_id: Any, conversation_id: Any = "") ->
 
 
 def _similar(a: str, b: str) -> bool:
-    """Two rejection reasons name the same problem (word overlap of at least one half)."""
+    """Two reasons name the same problem: at least one half of the smaller word set is in the other
+    (0.4.13, z19: a reworded reason counts as the same obstacle)."""
     wa = set(re.findall(r"[\w./-]{3,}", (a or "").lower()))
     wb = set(re.findall(r"[\w./-]{3,}", (b or "").lower()))
     if not wa or not wb:
         return False
-    return len(wa & wb) / len(wa | wb) >= 0.5
+    return len(wa & wb) / min(len(wa), len(wb)) >= 0.5
 
 
 DECISION_TEXT = {
@@ -675,7 +700,9 @@ class _Tools:
             state.deferred = []
             state.decision_goals = {}
             state.idle_nudges = 0
-            self.store.open_gate(session)
+            state.owner_wait_rounds = 0
+            # 0.4.13 (z18): 'list ok go' in one owner message: the go of this turn stays available.
+            self.store.open_gate(session, turn_go=self.store.gate_count(session, _TURN_GO) is not None)
         self.store.append_ledger(state.chat_key, "goals_changed" if change else "goals_set",
                                  count=len(goals))
         self.store.save(state)
@@ -696,7 +723,8 @@ class _Tools:
         if state.go and not paused:
             return f"Go already recorded. The loop works the {len(state.open_goals())} open goal(s)."
         count = self.store.gate_count(gate)
-        if not count:
+        turn_go = not count and self.store.gate_turn_go(gate)
+        if not count and not turn_go:
             self.store.append_ledger(state.chat_key, "go_refused", owner_messages=count)
             return GO_REFUSED
         state.resumes = 0  # a new go allows resume_max new follow-up runs
@@ -711,12 +739,14 @@ class _Tools:
         state.idle_nudges = 0
         state.tool_calls_at_nudge = -1
         state.decisions_at_nudge = len(state.decisions)  # 0.4.3: base of the owner wait
+        state.owner_wait_rounds = 0  # 0.4.13 (z19)
         _lift_decision_wait(self.store, state, "go")  # 0.4.5 (r32)
         state.boot_id = BOOT_ID
         self.store.append_ledger(state.chat_key, "go", owner_messages=count,
-                                 resumed=[g.id for g in paused])
+                                 resumed=[g.id for g in paused], turn_go=bool(turn_go))
         self.store.save(state)
         self.store.close_gate(gate)
+        self.store.close_gate(gate, _TURN_GO)
         return f"Go recorded. The loop will work the {len(state.open_goals())} open goal(s) to the end."
 
     def goal_status(self, args: dict[str, Any], **kwargs: Any) -> str:
@@ -737,6 +767,7 @@ class _Tools:
         if gid and (goal is None or goal.done):
             return f"error: unknown or finished goal_id {gid!r}"
         state.decisions.append(text)
+        state.round_progress = True  # 0.4.13 (z19)
         number = len(state.decisions)
         if goal is not None:
             state.decision_goals[str(number)] = goal.id
@@ -801,6 +832,8 @@ class _Tools:
         nxt = str(args.get("next") or "").strip()
         if not step or not nxt:
             return "error: step and next are required"
+        if step[:500] != goal.progress.get("step"):
+            state.round_progress = True  # 0.4.13 (z19): only a new step is progress
         goal.progress = {"step": step[:500], "evidence": str(args.get("evidence") or "").strip()[:500],
                          "next": nxt[:500]}
         self.store.append_ledger(state.chat_key, "progress", goal_id=goal.id, step=step[:200])
@@ -839,6 +872,7 @@ class _Tools:
             _JUDGE_PARENTS.pop(conv, None)
         state = self.store.load(state.chat_key)  # the judge run may take minutes
         goal = state.goal(goal.id) or goal
+        state.round_progress = True  # 0.4.13 (z19): a claim is progress of the round
         if verdict.done:
             goal.done = True
             goal.status = "done"
@@ -854,6 +888,7 @@ class _Tools:
             # L10: the judge did not answer; the goal keeps its status.
             self.store.append_ledger(state.chat_key, "judge_unavailable", goal_id=goal.id,
                                      reason=verdict.reason[:200])
+            self.store.save(state)
             return (f"Judge unavailable for {goal.id} ({verdict.reason}). The goal keeps its status. "
                     "Submit the same claim again; do not redo the work.")
         if verdict.wait:
@@ -1130,6 +1165,27 @@ def _owner_wait(state: GoalState) -> bool:
             and all(g.block_tries >= 1 and g.block_seq >= 0 for g in open_goals))
 
 
+def _owner_only(state: GoalState) -> bool:
+    """0.4.13 (z19): only the owner can move the open goals: each one got a goal_block since the last
+    owner message, or a refused change of the list waits for the owner's approval."""
+    open_goals = state.open_goals()
+    if not open_goals:
+        return False
+    if all(g.block_tries >= 1 and g.block_seq >= 0 for g in open_goals):
+        return True
+    return any(e.get("kind") == "change" and not e.get("shown") for e in state.deferred)
+
+
+def _count_owner_round(state: GoalState) -> None:
+    """0.4.13 (z19): at the end of a round, count it when it had no progress and only the owner can
+    move the open goals; else start the count again."""
+    if state.round_progress or not _owner_only(state):
+        state.owner_wait_rounds = 0
+    else:
+        state.owner_wait_rounds += 1
+    state.round_progress = False
+
+
 def _wait_reason(state: GoalState, session_id: str) -> str:
     """Why the loop must not continue now, as a ledger event name; '' = continue."""
     if _builtin_goal_active(session_id):
@@ -1142,7 +1198,7 @@ def _wait_reason(state: GoalState, session_id: str) -> str:
         return "waiting_stop_cause"
     if state.decision_wait:
         return "waiting_decision"
-    if _owner_wait(state):
+    if _owner_wait(state) or state.owner_wait_rounds >= OWNER_WAIT_ROUNDS:
         return "waiting_owner"
     return ""
 
@@ -1259,6 +1315,7 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             return None
         # 0.4.5 (r32): the stop-cause line of this answer.
         cause = _note_stop_cause(store, state, final_response)
+        _count_owner_round(state)  # 0.4.13 (z19)
         # 0.4.3: no push while Hermes work or the owner is awaited (the end of that work, or an owner
         # message, starts the next turn, and this hook runs again then).
         why = _wait_reason(state, session_id)
@@ -1352,7 +1409,8 @@ def _display_block(state: GoalState) -> str:
             state.mark_all_shown()
             return status_block(state)
         # goal-loop-quiet decision 4a: a decision recorded after the final list still shows once
-    free = bool(_actionable(state))
+    # 0.4.13 (z19): after the owner-only rounds no goal can move without the owner.
+    free = bool(_actionable(state)) and state.owner_wait_rounds < OWNER_WAIT_ROUNDS
     pending = [e for e in state.deferred if not e.get("shown")]
     held_numbers = {int(e.get("number") or 0) for e in pending if e.get("kind") == "decision"}
     held_goals = {str(e.get("goal_id") or "") for e in pending if e.get("kind") == "block"}
@@ -1473,6 +1531,7 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             return None
         _note_turn_end(store, session_id)
         _end_turn(session_id, _chat_key(conversation_id or session_id))  # 0.4.9 (z11)
+        _end_turn_go(store, _gate_for(store, session_id, conversation_id))
         body = response_text if isinstance(response_text, str) and response_text else text
         if not isinstance(body, str):
             return None
@@ -1646,6 +1705,15 @@ def _note_turn_start(store: GoalStore, session_id: Any, platform: str, conversat
         logger.debug("goal-loop running note not written", exc_info=True)
 
 
+def _end_turn_go(store: GoalStore, gate: str) -> None:
+    """0.4.13 (z18): the go of the last owner message is not available any more for a goal_set."""
+    try:
+        store.close_gate(gate, _TURN_GO)
+        store.drop_turn_go(gate)
+    except Exception:
+        logger.debug("goal-loop turn go not removed", exc_info=True)
+
+
 def _note_turn_end(store: GoalStore, session_id: Any) -> None:
     try:
         from . import restart_resume
@@ -1722,6 +1790,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                 # L15: a follow-up run of the plugin is never an owner message (no go, no
                 # change approval, no restart re-arm); it gets the goal context.
                 key = _gate_for(store, session_id, _.get("conversation_id"))
+                _end_turn_go(store, key)
                 _log_resume_turn(store, key, session_id, text)  # 0.4.7 (z6)
                 _take_request(store, key, text)
                 if store.exists(key):
@@ -1744,6 +1813,9 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             go = _has_go(text, vocabulary[0])
             if go:
                 store.bump_gate(gate)  # R1 c: only a 'go' message counts for goal_go
+                store.open_gate(gate, _TURN_GO)
+            else:
+                _end_turn_go(store, gate)
             store.bump_gate(gate, "change")
             store.open_gate(gate, f"boot{BOOT_ID[:12]}")
             _note_model(store, gate, model)
@@ -1758,6 +1830,8 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
             state.tool_calls_at_resume = -1
             for g in state.goals:
                 g.block_seq = -1
+            state.owner_wait_rounds = 0  # 0.4.13 (z19)
+            state.round_progress = False
             state.wait_reason = ""
             state.stop_hold = ""
             state.bg_wait = {}  # 0.4.7 (z5): the owner answered; the watchdog has nothing to do
@@ -1802,9 +1876,15 @@ def make_pre_api_request(store: GoalStore, settings: Optional[Settings] = None):
         try:
             index, row = next(((i, m) for i, m in reversed(list(enumerate(conversation_history)))
                                if isinstance(m, dict) and m.get("role") == "user"), (-1, None))
-            if row is None or not str(row.get("api_content") or "").startswith(_REDIRECT_PREFIX):
+            if row is None:
                 return None
             text = _message_text(row.get("content")).strip()
+            redirect = str(row.get("api_content") or "").startswith(_REDIRECT_PREFIX)
+            steer = row.get("display_kind") == _STEER_DISPLAY_KIND or _STEER_MARKER in text
+            if not redirect and not steer:
+                return None
+            if steer:
+                text = _STEER_MARKER_LINE.sub("", text).strip()  # the go detection sees only the owner text
             if not text:
                 return None
             mark = hashlib.sha256(f"{index}\n{text}".encode("utf-8")).hexdigest()[:16]

@@ -34,6 +34,13 @@ patch the plugin's tools still work and the hook is simply never called.
    recommendation); the chat shows the decisions as a numbered text list — no card, no
    modal.
 
+## Steer row, owner-only rounds, turn go (0.4.13)
+
+An owner message that interrupts a running turn (Hermes steer row) pauses the loop, or gives
+the go when it has 'go'. When only the owner can move the open goals and 2 rounds in a row
+bring no progress, the loop waits for the owner and shows the deferred list. 'list ok go' in
+one message starts the loop after a `goal_set` of a fresh list in the same turn.
+
 ## Background watchdog (0.4.12)
 
 A tool call creates the turn mark when it is absent (a turn that started before a plugin

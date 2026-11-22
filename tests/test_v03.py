@@ -315,9 +315,11 @@ class L11L14BlockTest(unittest.TestCase):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         reason = "token for the API is missing in the env file"
-        for _ in range(2):
+        for n in range(2):
             tool(store)
             stop(store, s)
+            # 0.4.13 (z19): a round with only a goal_block is no progress, and 2 such rounds stop the loop
+            tools.goal_progress({"goal_id": "g1", "step": f"step {n}", "next": "next"}, **IDS)
             self.assertIn("Block noted", tools.goal_block({"goal_id": "g1", "reason": reason}, **IDS))
             # a second call in the same round does not count
             self.assertIn("Block noted", tools.goal_block({"goal_id": "g1", "reason": reason}, **IDS))
