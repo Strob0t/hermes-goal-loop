@@ -25,7 +25,7 @@ def waiting(**settings):
     goal_loop._turn_marks().clear()
     patch, proc, registry = bg_modules(running=True)
     with patch:
-        make_pre_stop(store, s)(session_id="s1", platform="local", attempt=0, final_response="warte auf proc_9")
+        make_pre_stop(store, s)(session_id="s1", platform="local", attempt=0, final_response="waits for proc_9")
     state = store.load(KEY)
     assert state.wait_reason == "waiting_background", state.wait_reason
     return store, s
@@ -66,12 +66,12 @@ class ActiveTurnTest(unittest.TestCase):
         tools, store, _, s = setup(idle_pause_after=0)
         set_and_go(tools, store)
         goal_loop._turn_marks().clear()
-        make_pre_llm_call(store, s)(session_id="s1", platform="local", user_message="weiter mit z7",
-                                    conversation_history=[{"role": "user", "content": "weiter mit z7"}])
+        make_pre_llm_call(store, s)(session_id="s1", platform="local", user_message="go on with z7, go",
+                                    conversation_history=[{"role": "user", "content": "go on with z7, go"}])
         self.assertIn("s1", goal_loop._turn_marks())
         make_post_tool_call(store)(tool_name="terminal", session_id="s1", conversation_id="")
         self.assertIn("s1", goal_loop._turn_marks())
-        make_transform_llm_output(store, s)(response_text="Stand", session_id="s1", platform="local")
+        make_transform_llm_output(store, s)(response_text="Status", session_id="s1", platform="local")
         self.assertNotIn("s1", goal_loop._turn_marks())
         self.assertNotIn(KEY, goal_loop._turn_marks())
 
@@ -108,7 +108,7 @@ def nine_decisions():
     set_and_go(tools, store)
     tool(store)
     for i in range(1, 10):
-        tools.goal_decision({"text": f"Frage {i}: A/B/C"}, **IDS)
+        tools.goal_decision({"text": f"Question {i}: A/B/C", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
     make_transform_llm_output(store, s)(response_text="x", session_id="s1", platform="api_server")
     return tools, store, s
 
@@ -139,7 +139,7 @@ class SeparatorAnswerTest(unittest.TestCase):
         self.assertFalse(store.load(KEY).decision_wait)
 
     def test_questions_and_versions_close_none(self):
-        for text in ("was bedeutet 8?", "läuft 0.4.8 A schon?", "um 20:15 A", "zeige mir 8"):
+        for text in ("what does 8 mean?", "does 0.4.8 A run yet?", "at 20:15 A", "show me 8"):
             with self.subTest(text=text):
                 tools, store, s = nine_decisions()
                 owner(store, text, settings=s)

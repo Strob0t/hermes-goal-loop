@@ -42,14 +42,49 @@ there is news for the owner:
 |---|---|
 | `goal_set` set the list (before the go) | the full list with each check and status, then the go question as the last line; the model does not repeat the list |
 | `goal_set` changed the list after the go (owner-approved) | the full list with each check and status |
-| after the go: a goal became blocked or paused, or a new owner decision | only these items (`Goal status (needs the owner):`), each one time |
+| after the go: a goal became blocked or paused, or a new owner decision, while another goal is actionable | nothing; the item goes into the deferred list (0.4.10) |
+| after the go: no goal is actionable any more | the deferred list (`Goal status (needs the owner):`, decisions with options, blocked goals with reason, the pending list change), each item one time |
 | progress, a goal in work, a judge rejection, a confirmed goal while others are open | nothing |
-| the turn ends after the go while goals are still open | one line: a follow-up run continues the loop (`resume`), else the loop is paused, write to continue (`paused_hint`) |
+| the turn ends after the go while goals are still open | nothing; the model gets a note for the next turn: a follow-up run continues the loop (`resume`), else the loop is paused (`paused_hint`) |
 | the judge confirmed the last goal | the full list with checkmarks, one time, with the final report |
 | after the final list, until a new `goal_set` | only a new owner decision, one time |
 
-Labels follow the owner language (`language`: `auto` from the owner messages, `de` or `en`).
-Goal text and check are written by the model in the owner language (usage hint).
+The labels are English. Goal text, check and decision text stay as the model wrote them (in the
+owner's language, usage hint). Lines that explain the loop state (wait, pause, restart, follow-up
+run) are not appended to the answer: they go to the model as context, and the model writes them in
+the owner's language at the end of its answer.
+
+## Owner messages (0.4.10)
+
+- Each owner message pauses the loop while it has a go and open goals: `go` becomes false, a
+  pending follow-up run is cancelled, the background and owner waits are cleared, ledger
+  `paused_by_owner_message`. While paused, `pre_stop` does not continue, no follow-up run is
+  scheduled or injected, and the background watchdog does not continue the chat.
+- A message with the word `go` as a token (case-insensitive, alone or with other text, for example
+  `4B 5C go`) keeps the go, or gives it again after a pause.
+- The paused turn gets a context note: answer the message, put any question at the end, ask the
+  owner to write `go`. `goal_go` is refused until an owner message with `go` comes in.
+- Decisions close by number with an option (`4B`, `8. A`), by `go`, or by explicit consent
+  (`ok`, `recommendation`, `all your recommendations`).
+- Owner words in other languages: the optional file `<state dir>/vocabulary.json`, for example
+  `{"go_words": ["onward"], "consent_patterns": ["^\\s*fine\\s*$"]}`. Without the file only the
+  English defaults apply.
+
+## Deferred list (0.4.10)
+
+`goal_decision` takes an optional `goal_id`. A goal with an open linked decision, or with status
+blocked or paused, waits for the owner. The other unfinished goals are actionable (a goal that waits
+for a background process or a delegation is actionable later). While a goal is actionable, a new
+decision, a `goal_block` and a refused `goal_set` change go into `state.deferred` (with time and
+text); the tool answer names the goals to continue with, the answer block does not show the items,
+and `pre_stop` continues, also after an answer with the stop cause `owner-question`. When no goal is
+actionable, the answer block shows the deferred list one time and the loop waits for the owner.
+
+## Evidence (0.4.10)
+
+`goal_decision` requires `evidence`: the command or file that showed the live state, and its time.
+Without it the tool records nothing. The prompt section and the pause note say: check each point
+against the live state in this turn; do not rely on the chat history or memory.
 
 The state file records what the chat has shown (`list_changed`, `final_shown`,
 `decisions_shown`, `block_shown` for each goal). A state file of an older plugin version
@@ -115,16 +150,17 @@ started before the plugin update gets the hint only after a new session.
 
 `goal_set`, `goal_go`, `goal_status`, `goal_claim`, `goal_progress`, `goal_decision`, `goal_block`.
 
-- `goal_set` after the go is refused until an owner message approves the change; judge-confirmed goals stay done.
+- `goal_set` after the go is refused until an owner message approves the change (while a goal is actionable, the change goes into the deferred list); judge-confirmed goals stay done.
+- `goal_decision` requires `evidence` and takes an optional `goal_id` (the goal that waits for it).
 - `goal_block` needs a reason and is accepted only when the same obstacle stays for `block_min_rounds` continuation rounds.
 - `goal_progress` records the last step, its evidence and the next step; the goal context of each turn shows it.
-- `goal_go` also resumes paused goals (budget, idle, rejections, stop word, restart).
+- `goal_go` also resumes paused goals (budget, idle, rejections, owner pause, restart); it needs an owner message with `go`.
 
 ## Hooks
 
 - `pre_stop`: continuation with the open goals (text, check, progress), budget, idle and restart limits.
-- `transform_llm_output`: status display in the owner language; one line when a turn ends with open goals.
-- `pre_llm_call`: owner-message count (go and change gates), stop words, language votes, goal context for each owner turn.
+- `transform_llm_output`: status display (English labels); the loop-state note for the model when a turn ends with open goals.
+- `pre_llm_call`: owner-message count (go and change gates), the owner pause, the vocabulary file, goal context and loop-state notes for each owner turn.
 - `pre_api_request` (0.4.4): counts an owner message that interrupted a running turn (Hermes applies it as a
   user row with the api_content prefix `[Context from the interrupted assistant response]` and starts no new
   turn, so `pre_llm_call` does not run); each such row counts one time (ledger `owner_redirect_counted`).
@@ -161,9 +197,7 @@ Plus one system-prompt section (`goal-loop`) and the auxiliary task `goal_loop_j
   | `judge_attempt_timeout` | 120 | seconds of one judge attempt; a retry gets a shortened claim |
   | `judge_backoff` | 5 | pause before attempt n+1 (`judge_backoff * n` seconds); ledger `judge_retry` |
   | `stale_days` | 1 | at plugin start a state with a go and open goals without activity for this many days is paused (`paused_stale`, one decision; 0 = off) |
-  | `language` | `auto` | `auto` (from the owner messages), `de` or `en` for the plugin labels |
-  | `paused_hint` | true | one line when a turn ends with open goals after the go and no follow-up run is scheduled |
-  | `stop_words` | stopp, stop, halt, pause, pausiere, abbrechen | an owner message that is one of these pauses the loop |
+  | `paused_hint` | true | a note for the model when a turn ends with open goals after the go and no follow-up run is scheduled |
   | `resume` | true | follow-up runs (see **Follow-up runs**) |
   | `resume_delay` | 1m | delay of a follow-up run after the end of a run |
   | `resume_max` | 20 | follow-up runs per go; then pause + decision (0 = off) |
@@ -198,7 +232,7 @@ one follow-up turn through `PluginContext.inject_message`, which Hermes commits 
 the session (an owner message goes first). This needs `plugins.entries.goal-loop.allow_gateway_injection:
 true`; without it the ledger has `resume_inject_refused` and the answer ends with the paused line. A
 follow-up turn and an owner message start a new idle count, so a cut at the limit is no idle round.
-Limits: `resume_max`, `budget_per_goal`, the stop word.
+Limits: `resume_max`, `budget_per_goal`, the owner pause.
 
 Since 0.4.2 the follow-up turns themselves are counted: a follow-up turn without a tool call is idle,
 and `idle_pause_after` idle follow-up turns in a row pause the goals (`paused_idle`); only an owner
@@ -257,7 +291,7 @@ are still open, the plugin schedules one more run of the same session, without a
 
 The follow-up turn starts with `[goal-loop resume <nonce>]`. `pre_llm_call` never counts it as an
 owner message, so it gives no go and no change approval; it gets the goal context. Limits:
-`budget_per_goal`, the idle pause, the stop word, `resume_max`, one pending request per chat. A
+`budget_per_goal`, the idle pause, the owner pause, `resume_max`, one pending request per chat. A
 new go resets the count. Hermes must have `API_SERVER_KEY` (file `/run/secrets/hermes_api_key`
 or env) and cron scripts enabled.
 

@@ -104,7 +104,7 @@ def post(request, key, opener=None):
             return str((choice.get("message") or {}).get("content") or "")
         except urllib.error.HTTPError as exc:
             if exc.code != 429 or attempt == 2:
-                return f"goal-loop: Folge-Run nicht gestartet (HTTP {exc.code})."
+                return f"goal-loop: follow-up run not started (HTTP {exc.code})."
             time.sleep(10 * (attempt + 1))
     return ""
 

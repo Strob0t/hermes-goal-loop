@@ -173,9 +173,11 @@ class GoRuleTest(unittest.TestCase):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "x", "check": "c"}]}, **IDS)
         self.assertTrue(go(tools, store, **IDS).startswith("Go recorded"))
-        # L3: a change after the go needs the owner's approval in a new message
-        self.assertEqual(tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]}, **IDS),
-                         CHANGE_REFUSED)
+        # L3: a change after the go needs the owner's approval in a new message (0.4.10: while g1 can
+        # be worked, the refused change goes to the deferred list)
+        self.assertIn("recorded in the deferred list",
+                      tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]}, **IDS))
+        self.assertNotEqual(CHANGE_REFUSED, "")
         self.assertEqual(store.load(_chat_key("s1")).goal("g1").text, "x")
         owner_says(store, "s1", "ok, change it")
         self.assertIn("changed", tools.goal_set({"goals": [{"id": "g1", "text": "y", "check": "c"}]},
@@ -285,9 +287,9 @@ class DisplayOnSetAndChangeTest(unittest.TestCase):
         self.answer()
         go(self.tools, self.store, **IDS)
         self.assertIsNone(self.answer())
-        # L3: the first try is refused (the model asks), then the owner approves the change
-        self.assertEqual(self.tools.goal_set({"goals": [{"id": "g2", "text": "b", "check": "c2"}]},
-                                             **IDS), CHANGE_REFUSED)
+        # L3: the first try is refused (deferred while g1 can be worked), then the owner approves the change
+        self.assertIn("recorded in the deferred list",
+                      self.tools.goal_set({"goals": [{"id": "g2", "text": "b", "check": "c2"}]}, **IDS))
         owner_says(self.store, "s1", "add g2")
         self.tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                        {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
@@ -328,21 +330,30 @@ class AfterGoOwnerItemsTest(unittest.TestCase):
         return self.transform(response_text=text, **IDS)
 
     def test_a_blocked_goal_and_a_decision_appear(self):
+        # 0.4.10 (R2): the owner items are shown when no goal can be worked
         self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
-        self.tools.goal_decision({"text": "Name: A, B or C. Recommend A."}, **IDS)
+        self.tools.goal_block({"goal_id": "g3", "reason": "host down"}, **IDS)
+        self.tools.goal_decision({"text": "Name: A, B or C. Recommend A.", "goal_id": "g1", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         out = self.answer()
         self.assertIn("needs the owner", out)
         self.assertIn("g2: b", out)
         self.assertIn("[blocked] — token missing", out)
+        self.assertIn("[blocked] — host down", out)
         self.assertIn("1. Name: A, B or C. Recommend A.", out)
         self.assertNotIn("g1: a", out)   # no progress lines
-        self.assertNotIn("g3: c", out)
         self.assertIsNone(self.answer())  # each owner item is shown one time
 
+    def test_owner_items_wait_while_a_goal_can_be_worked(self):
+        self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
+        self.tools.goal_decision({"text": "Name: A, B or C. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
+        self.assertIsNone(self.answer())
+
     def test_a_second_decision_shows_only_the_new_one_with_its_number(self):
-        self.tools.goal_decision({"text": "first"}, **IDS)
+        self.tools.goal_block({"goal_id": "g2", "reason": "token missing"}, **IDS)
+        self.tools.goal_block({"goal_id": "g3", "reason": "host down"}, **IDS)
+        self.tools.goal_decision({"text": "first", "goal_id": "g1", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         self.answer()
-        self.tools.goal_decision({"text": "second"}, **IDS)
+        self.tools.goal_decision({"text": "second", "goal_id": "g1", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         out = self.answer()
         self.assertIn("2. second", out)
         self.assertNotIn("1. first", out)
@@ -377,7 +388,7 @@ class FinalListOnceTest(unittest.TestCase):
         self.assertTrue(store.load(_chat_key("s1")).final_shown)
         self.assertIsNone(transform(response_text="later", **IDS))
         # a decision after the final list still reaches the owner, one time
-        tools.goal_decision({"text": "late pick: A or B"}, **IDS)
+        tools.goal_decision({"text": "late pick: A or B", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         out = transform(response_text="AFTER", **IDS)
         self.assertIn("needs the owner", out)
         self.assertIn("1. late pick: A or B", out)
@@ -426,7 +437,7 @@ class GoalStatusToolTest(unittest.TestCase):
         self.assertEqual(tools.goal_status({}, **IDS), "No goals set.")
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"},
                                   {"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
-        tools.goal_decision({"text": "pick A"}, **IDS)
+        tools.goal_decision({"text": "pick A", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         out = tools.goal_status({}, **IDS)
         self.assertEqual(out, status_block(store.load(_chat_key("s1"))).lstrip("\n-"))
         self.assertTrue(out.startswith("Goal status:\n- [ ] g1: a (check: c1) [open]"))
@@ -741,8 +752,8 @@ class Goal5DecisionsTest(unittest.TestCase):
     def test_decisions_render_as_a_numbered_text_list(self):
         tools, store, _ = make_tools()
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c1"}]}, **IDS)
-        tools.goal_decision({"text": "Repo name: A public, B private. Recommend A."}, **IDS)
-        tools.goal_decision({"text": "Base tag: A v1, B v2. Recommend A."}, **IDS)
+        tools.goal_decision({"text": "Repo name: A public, B private. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
+        tools.goal_decision({"text": "Base tag: A v1, B v2. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         state = store.load(_chat_key("s1"))
         block = status_block(state)
         self.assertIn("Open decisions:", block)

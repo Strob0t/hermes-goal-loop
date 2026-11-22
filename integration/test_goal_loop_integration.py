@@ -177,7 +177,10 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         agent = SimpleNamespace(session_id="it-sess", model="m", platform="api_server")
         out, transformed, _ = apply_llm_output_transform(agent, "ANSWER", turn_id="t-resume")
         self.assertTrue(transformed)
-        self.assertIn("follow-up run", out)
+        # 0.4.10 (R3): the follow-up-run line is a note for the model, not answer text
+        self.assertNotIn("follow-up run", out)
+        state = self.tools.store.load(self.tools._load(IDS).chat_key)
+        self.assertIn("follow-up run", state.loop_note)
         self.assertEqual(len(self.jobs), 1)
         self.assertTrue(self.jobs[0]["no_agent"])
         self.assertEqual(parse_schedule(self.jobs[0]["schedule"])["kind"], "once")
@@ -381,11 +384,12 @@ class PluginAndPatchedForkTogetherTest(unittest.TestCase):
         self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
         tools.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **IDS)
         final, transformed, _ = turn("PROGRESS")                    # progress only: no goal block
-        # v0.3 (L15): the turn ends while g2 is open, so only the follow-up-run line is added
-        self.assertTrue(transformed)
+        # 0.4.10 (R3): the turn ends while g2 is open; the follow-up-run line is a note for the model
+        self.assertFalse(transformed)
         self.assertTrue(final.startswith("PROGRESS"))
-        self.assertIn("goal(s) open (g2)", final)
         self.assertNotIn("- [ ] g1: a", final)
+        state = tools.store.load(tools._load(IDS).chat_key)
+        self.assertIn("goal(s) open (g2)", state.loop_note)
         out = tools.goal_claim({"goal_id": "g2", "claim": {"summary": "s", **CHECKS}}, **IDS)
         self.assertIn("All goals are now confirmed", out)
         final, transformed, _ = turn("FINAL REPORT")                # turn 1: all confirmed

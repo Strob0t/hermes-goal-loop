@@ -16,6 +16,7 @@ from goal_loop import (
 from goal_loop.judge import Verdict, run_judge
 
 IDS = {"session_id": "s1", "platform": "api_server"}
+EV = "ls -l /tmp at 09:00, exit 0"
 CHECKS = {"checks": [{"command": "c", "result": "passed", "exitCode": 0}]}
 
 
@@ -210,7 +211,7 @@ class JudgeRetryTest(unittest.TestCase):
         for key in ("judge_attempts", "judge_attempt_timeout", "judge_backoff", "stale_days"):
             self.assertIn(key, readme)
         yaml = open(os.path.join(root, "goal_loop", "plugin.yaml"), encoding="utf-8").read()
-        self.assertRegex(yaml, r"version: 0\.4\.[3-9]")
+        self.assertRegex(yaml, r"version: 0\.4\.(?:[3-9]|1\d)\b")
 
 
 class StalePauseTest(unittest.TestCase):
@@ -273,15 +274,12 @@ class StalePauseTest(unittest.TestCase):
         self.assertTrue(state.go)
         self.assertEqual(state.goal("g1").status, "in_work")
 
-    def test_the_decision_text_is_in_the_owner_language(self):
+    def test_the_decision_text_is_english(self):
         tools, store, s = self._make(5)
-        state = store.load(_chat_key("s1"))
-        state.language = "de"
-        store.save(state)
         old = time.time() - 5 * 86400
         os.utime(store._state_path(_chat_key("s1")), (old, old))
-        pause_stale_states(store, Settings(overrides={"stale_days": 3, "language": "de"}))
-        self.assertIn("ohne Aktivität", store.load(_chat_key("s1")).decisions[-1])
+        pause_stale_states(store, Settings(overrides={"stale_days": 3}))
+        self.assertIn("no activity for 5 days", store.load(_chat_key("s1")).decisions[-1])
 
 
 def fake_modules(background=False, delegation=False, builtin=False):
@@ -345,7 +343,7 @@ class WaitBarrierTest(unittest.TestCase):
         tools, store, s = self._ready()
         with fake_modules():
             self.assertEqual(stop(store, s)["action"], "continue")  # round 1: nudge_seq 1
-            tools.goal_decision({"text": "A/B/C, recommendation A"}, **IDS)
+            tools.goal_decision({"text": "A/B/C, recommendation A", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
             tools.goal_block({"goal_id": "g1", "reason": "owner decision missing"}, **IDS)
             tool(store, "goal_block")
             self.assertIsNone(stop(store, s))
@@ -355,7 +353,7 @@ class WaitBarrierTest(unittest.TestCase):
         tools, store, s = self._ready()
         with fake_modules():
             self.assertEqual(stop(store, s)["action"], "continue")
-            tools.goal_decision({"text": "A/B/C"}, **IDS)
+            tools.goal_decision({"text": "A/B/C", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
             tool(store, "goal_decision")
             self.assertEqual(stop(store, s)["action"], "continue")  # goal not blocked yet
             tool(store, "terminal")
@@ -368,7 +366,7 @@ class WaitBarrierTest(unittest.TestCase):
     def test_an_old_decision_before_the_go_is_no_owner_wait(self):
         tools, store, _, s = setup(idle_pause_after=0)
         tools.goal_set({"goals": [{"id": "g1", "text": "a", "check": "c"}]}, **IDS)
-        tools.goal_decision({"text": "old"}, **IDS)
+        tools.goal_decision({"text": "old", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         owner(store, "go", settings=s)
         tools.goal_go({}, **IDS)
         tool(store)
@@ -392,7 +390,7 @@ class WaitBarrierTest(unittest.TestCase):
         tool(store)
         with fake_modules():
             self.assertEqual(stop(store, s)["action"], "continue")
-            tools.goal_decision({"text": "d"}, **IDS)
+            tools.goal_decision({"text": "d", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
             tools.goal_block({"goal_id": "g1", "reason": "owner decision missing"}, **IDS)
             tool(store, "goal_block")
             self.assertEqual(stop(store, s)["action"], "continue")  # g2 is not blocked
@@ -401,7 +399,7 @@ class WaitBarrierTest(unittest.TestCase):
         tools, store, s = self._ready()
         with fake_modules(background=True):
             self.assertIsNone(stop(store, s))
-            owner(store, "weiter", settings=s)
+            owner(store, "go", settings=s)
             self.assertEqual(store.load(_chat_key("s1")).wait_reason, "")
         with fake_modules():
             tool(store)
@@ -423,7 +421,7 @@ class WaitBarrierTest(unittest.TestCase):
                                           "hermes_cli.goals": None}):
             self.assertEqual(stop(store, s)["action"], "continue")
 
-    def test_the_display_shows_a_wait_line_and_no_follow_up(self):
+    def test_the_display_records_a_wait_note_and_no_follow_up(self):
         tools, store, s = self._ready()
         sent = []
         goal_loop._CTX = types.SimpleNamespace(inject_message=lambda text: sent.append(text) or True)
@@ -433,8 +431,8 @@ class WaitBarrierTest(unittest.TestCase):
                                                           platform="local")
         finally:
             goal_loop._CTX = None
-        self.assertIsNotNone(out)
-        self.assertIn("waits", out)
+        self.assertNotIn("waits", out or "")  # 0.4.10 (R3): the wait note is context for the model
+        self.assertIn("The loop waits", store.load(_chat_key("s1")).loop_note)
         self.assertEqual(sent, [])
         self.assertNotIn("resume_injected", ledger_events(store))
 
@@ -449,7 +447,8 @@ class WaitBarrierTest(unittest.TestCase):
         finally:
             goal_loop._CTX = None
         self.assertEqual(len(sent), 1)
-        self.assertIn("continues in this chat", out)
+        self.assertNotIn("continues", out or "")
+        self.assertIn("continues in this chat", store.load(_chat_key("s1")).loop_note)
 
 
 if __name__ == "__main__":

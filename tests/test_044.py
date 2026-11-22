@@ -94,7 +94,7 @@ class OwnerRedirectTest(unittest.TestCase):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         refused_change(tools)
-        api_request(store, s, history_with_redirect("Freigabe"))
+        api_request(store, s, history_with_redirect("approved"))
         self.assertEqual(store.gate_count(_chat_key("s1"), "change"), 1)
         self.assertTrue(tools.goal_set({"goals": [{"id": "g2", "text": "b", "check": "c2"}]}, **IDS)
                         .startswith("Goal list changed"))
@@ -103,7 +103,7 @@ class OwnerRedirectTest(unittest.TestCase):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         refused_change(tools)
-        history = history_with_redirect("Freigabe")
+        history = history_with_redirect("approved")
         for _ in range(4):                   # pre_api_request runs before each API call of the turn
             api_request(store, s, history)
         self.assertEqual(store.gate_count(_chat_key("s1"), "change"), 1)
@@ -124,7 +124,7 @@ class OwnerRedirectTest(unittest.TestCase):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         refused_change(tools)
-        api_request(store, s, [{"role": "user", "content": "Freigabe"}])
+        api_request(store, s, [{"role": "user", "content": "approved"}])
         self.assertEqual(store.gate_count(_chat_key("s1"), "change"), 0)
 
     def test_a_follow_up_run_row_is_not_counted(self):
@@ -134,18 +134,18 @@ class OwnerRedirectTest(unittest.TestCase):
         api_request(store, s, [{"role": "user", "content": "x", "api_content": "[goal-loop resume abc] x"}])
         self.assertEqual(store.gate_count(_chat_key("s1"), "change"), 0)
 
-    def test_a_stop_word_as_redirect_pauses_the_goals(self):
+    def test_a_redirect_without_go_pauses_the_goals(self):
         tools, store, _, s = setup()
         set_and_go(tools, store)
-        api_request(store, s, history_with_redirect("stopp"))
-        self.assertIn("paused_by_owner", ledger_events(store))
+        api_request(store, s, history_with_redirect("stop"))
+        self.assertIn("paused_by_owner_message", ledger_events(store))
 
     def test_the_subagent_platform_is_excluded(self):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         refused_change(tools)
         make_pre_api_request(store, s)(session_id="s1", platform="subagent",
-                                       conversation_history=history_with_redirect("Freigabe"))
+                                       conversation_history=history_with_redirect("approved"))
         self.assertEqual(store.gate_count(_chat_key("s1"), "change"), 0)
 
 

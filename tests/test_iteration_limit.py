@@ -53,31 +53,31 @@ class LocalFollowUpTest(unittest.TestCase):
         # no owner message: neither the go gate nor the change gate counts it
         self.assertEqual((store.gate_count(key), store.gate_count(key, "change")), before)
 
-    def test_a_refused_inject_gives_the_paused_line(self):
+    def test_a_refused_inject_gives_the_paused_note(self):
         tools, store, _, out = self.run_turn_end(accept=False)
-        self.assertTrue("pausiert" in out.lower() or "paused" in out.lower())
         state = store.load(tools._load(LOCAL).chat_key)
+        self.assertIn("paused", state.loop_note.lower())  # 0.4.10 (R3): a note for the model
         self.assertEqual(state.resumes, 0)
         self.assertEqual(store.read_ledger(state.chat_key)[-1]["event"], "resume_inject_refused")
 
     def test_resume_max_stops_the_injects(self):
         tools, store, s, _ = self.run_turn_end(resume_max=1)
-        make_transform_llm_output(store, s)(response_text="Zweiter Bericht.", **LOCAL)
+        make_transform_llm_output(store, s)(response_text="Second report.", **LOCAL)
         self.assertEqual(len(goal_loop._CTX.sent), 1)
 
     def test_a_stopped_loop_injects_nothing(self):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         goal_loop._CTX = Ctx()
-        owner(store, "stopp", settings=s)
-        make_transform_llm_output(store, s)(response_text="Bericht.", **LOCAL)
+        owner(store, "stop", settings=s)
+        make_transform_llm_output(store, s)(response_text="Report.", **LOCAL)
         self.assertEqual(goal_loop._CTX.sent, [])
 
     def test_api_server_keeps_the_cron_follow_up_run(self):
         tools, store, _, s = setup()
         set_and_go(tools, store)
         goal_loop._CTX = Ctx()
-        make_transform_llm_output(store, s)(response_text="Bericht.", session_id="s1", platform="api_server")
+        make_transform_llm_output(store, s)(response_text="Report.", session_id="s1", platform="api_server")
         self.assertEqual(goal_loop._CTX.sent, [])
 
 
@@ -100,7 +100,7 @@ class IdleAfterLimitTest(unittest.TestCase):
         set_and_go(tools, store)
         stop(store, s, 0)
         stop(store, s, 1)
-        owner(store, "Bitte mach mit den offenen Zielen weiter", settings=s)
+        owner(store, "Please go on with the open goals, go", settings=s)
         stop(store, s, 0)
         state = store.load(tools._load({"session_id": "s1"}).chat_key)
         self.assertNotEqual(state.goal("g1").status, "paused")
@@ -137,7 +137,7 @@ class IdleFollowUpChainTest(unittest.TestCase):
 
     def test_an_owner_message_resets_the_idle_follow_up_count(self):
         tools, store, s = self.run_ends(3)
-        owner(store, "Bitte mach weiter", settings=s)
+        owner(store, "Please go on, go", settings=s)
         state = store.load(tools._load(LOCAL).chat_key)
         self.assertEqual(state.idle_resumes, 0)
         self.assertEqual(state.tool_calls_at_resume, -1)

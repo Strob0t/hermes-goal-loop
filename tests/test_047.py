@@ -46,14 +46,14 @@ def ready(**settings):
 
 
 def block_text(store, s, platform="api_server"):
-    return make_transform_llm_output(store, s)(response_text="Zwischenstand", session_id="s1", platform=platform) or ""
+    return make_transform_llm_output(store, s)(response_text="Interim report", session_id="s1", platform=platform) or ""
 
 
 class DecisionsByNumberTest(unittest.TestCase):
     def _three(self):
         tools, store, s = ready()
-        for text in ("Frage eins: A/B/C", "Frage zwei: A/B/C", "Frage drei: A/B/C"):
-            tools.goal_decision({"text": text}, **IDS)
+        for text in ("Question one: A/B/C", "Question two: A/B/C", "Question three: A/B/C"):
+            tools.goal_decision({"text": text, "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         block_text(store, s)  # shown once
         return tools, store, s
 
@@ -63,9 +63,9 @@ class DecisionsByNumberTest(unittest.TestCase):
         state = store.load(_chat_key("s1"))
         self.assertEqual([i for i, _ in state.open_decisions()], [1, 3])
         text = block_text(store, s)
-        self.assertIn("1. Frage eins", text)
-        self.assertIn("3. Frage drei", text)
-        self.assertNotIn("Frage zwei", text)
+        self.assertIn("1. Question one", text)
+        self.assertIn("3. Question three", text)
+        self.assertNotIn("Question two", text)
         self.assertIn("decisions_closed", ledger_events(store))
 
     def test_several_numbers_close_several(self):
@@ -77,60 +77,67 @@ class DecisionsByNumberTest(unittest.TestCase):
         tools, store, s = self._three()
         owner(store, "go", settings=s)
         self.assertEqual(store.load(_chat_key("s1")).open_decisions(), [])
-        self.assertNotIn("Offene Entscheidungen", block_text(store, s))
+        self.assertNotIn("Open decisions", block_text(store, s))
 
     def test_an_answer_without_a_number_closes_all(self):
-        # 0.4.8 (z10): only explicit consent without a number closes all ('nimm die Empfehlung' closes none)
+        # 0.4.8 (z10): only explicit consent without a number closes all ('take the recommendation' closes none)
         tools, store, s = self._three()
-        owner(store, "nimm die Empfehlung", settings=s)
+        owner(store, "take the recommendation", settings=s)
         self.assertEqual(len(store.load(_chat_key("s1")).open_decisions()), 3)
-        owner(store, "Empfehlung", settings=s)
+        owner(store, "recommendation", settings=s)
         self.assertEqual(store.load(_chat_key("s1")).open_decisions(), [])
 
     def test_a_question_closes_none(self):
         tools, store, s = self._three()
-        owner(store, "Was bedeutet Option B bei 2?", settings=s)
+        owner(store, "What does option B mean for 2?", settings=s)
         self.assertEqual(len(store.load(_chat_key("s1")).open_decisions()), 3)
 
     def test_goal_ids_are_no_decision_numbers(self):
         tools, store, s = self._three()
-        owner(store, "r4b A und z4 C", settings=s)  # 0.4.8 (z10): no decision number and no consent: closes none
+        owner(store, "r4b A and z4 C", settings=s)  # 0.4.8 (z10): no decision number and no consent: closes none
         self.assertEqual(len(store.load(_chat_key("s1")).open_decisions()), 3)
 
     def test_a_new_decision_after_the_answer_is_shown(self):
         tools, store, s = self._three()
         owner(store, "1A", settings=s)
         block_text(store, s)
-        tools.goal_decision({"text": "Frage vier: A/B/C"}, **IDS)
+        tools.goal_decision({"text": "Question four: A/B/C", "evidence": "ls -l /tmp at 09:00, exit 0"}, **IDS)
         text = block_text(store, s)
-        self.assertIn("4. Frage vier", text)
-        self.assertNotIn("Frage eins", text)
+        self.assertIn("4. Question four", text)
+        self.assertNotIn("Question one", text)
 
     def test_the_full_list_shows_only_open_decisions(self):
         tools, store, s = self._three()
         owner(store, "1B", settings=s)
         from goal_loop.state import status_block
-        full = status_block(store.load(_chat_key("s1")), "de")
-        self.assertNotIn("Frage eins", full)
-        self.assertIn("2. Frage zwei", full)
+        full = status_block(store.load(_chat_key("s1")))
+        self.assertNotIn("Question one", full)
+        self.assertIn("2. Question two", full)
 
 
 class RestartLineTest(unittest.TestCase):
-    def test_the_first_answer_after_a_restart_says_the_loop_is_held(self):
+    def _resume_turn(self, store, s):
+        text = "[goal-loop resume 0011223344556677] Hermes restarted while your last turn was running."
+        return make_pre_llm_call(store, s)(session_id="s1", platform="api_server", user_message=text,
+                                           conversation_history=[{"role": "user", "content": text}]) or ""
+
+    def test_the_first_turn_after_a_restart_gets_the_restart_note_as_context(self):
+        # 0.4.10 (R3): the note goes to the model; the model writes it in the owner's language.
         tools, store, s = ready()
-        owner(store, "bitte mach weiter mit dem Ziel und dann ist es gut", settings=s)  # German chat
         with mock.patch.object(goal_loop, "BOOT_ID", "f" * 32):
-            first = block_text(store, s)
-            second = block_text(store, s)
-        self.assertIn("Neustart: Schleife angehalten, schreib weiter", first)
-        self.assertNotIn("Neustart:", second)
+            first = self._resume_turn(store, s)
+            second = self._resume_turn(store, s)
+            answer = block_text(store, s)
+        self.assertIn("Hermes restarted: the goal loop is held", first)
+        self.assertIn("write this in the owner's language at the end of your answer", first.lower())
+        self.assertNotIn("Hermes restarted:", second)
+        self.assertNotIn("restarted", answer)
         self.assertIn("restart_hold_note", ledger_events(store))
 
-    def test_no_restart_line_in_the_same_process(self):
+    def test_no_restart_note_in_the_same_process(self):
         tools, store, s = ready()
-        text = block_text(store, s)
-        self.assertNotIn("Neustart:", text)
-        self.assertNotIn("Restart:", text)
+        self.assertNotIn("Hermes restarted:", self._resume_turn(store, s))
+        self.assertNotIn("Restart", block_text(store, s))
 
     def test_the_loop_stays_held_after_the_line(self):
         tools, store, s = ready()
@@ -150,7 +157,7 @@ class BackgroundWatchdogTest(unittest.TestCase):
         patch, proc, registry = bg_modules(running=True)
         with patch:
             self.assertIsNone(make_pre_stop(store, s)(session_id="s1", platform=platform, attempt=0,
-                                                      final_response="warte auf proc_9"))
+                                                      final_response="waits for proc_9"))
         state = store.load(_chat_key("s1"))
         self.assertEqual(state.wait_reason, "waiting_background")
         self.assertEqual(state.bg_wait["procs"], ["proc_9"])
@@ -209,7 +216,7 @@ class BackgroundWatchdogTest(unittest.TestCase):
 
     def test_an_owner_message_clears_the_wait(self):
         tools, store, s = self._waiting()
-        owner(store, "wie ist der Stand?", settings=s)
+        owner(store, "what is the status?", settings=s)
         self.assertEqual(store.load(_chat_key("s1")).bg_wait, {})
 
 

@@ -29,19 +29,19 @@ def dead_note(state_dir, sid, **extra):
 class NoteTest(unittest.TestCase):
     def test_a_turn_writes_a_note_at_start_and_removes_it_at_the_end(self):
         tools, store, _, s = setup()
-        owner(store, "Bitte prüfe den Dienst und berichte mir", settings=s)
+        owner(store, "Please check the service and report to me", settings=s)
         path = restart_resume.path_for(store.base_dir, "s1")
         self.assertTrue(os.path.exists(path))
         with open(path, encoding="utf-8") as handle:
             note = json.load(handle)
         self.assertEqual(note["pid"], os.getpid())
         from goal_loop import make_transform_llm_output
-        make_transform_llm_output(store, s)(response_text="fertig", **IDS)
+        make_transform_llm_output(store, s)(response_text="complete", **IDS)
         self.assertFalse(os.path.exists(path))
 
     def test_the_setting_off_writes_no_note(self):
         tools, store, _, s = setup(restart_resume=False)
-        owner(store, "Bitte prüfe den Dienst", settings=s)
+        owner(store, "Please check the service", settings=s)
         self.assertFalse(os.path.exists(restart_resume.path_for(store.base_dir, "s1")))
 
 
@@ -119,14 +119,14 @@ class RunTest(unittest.TestCase):
                 return False
 
             def read(self):
-                return b'{"choices": [{"message": {"content": "weiter"}}]}'
+                return b'{"choices": [{"message": {"content": "onward"}}]}'
 
         def opener(req, timeout=None):
             seen["url"] = req.full_url
             seen["headers"] = dict(req.header_items())
             seen["body"] = json.loads(req.data)
             return Resp()
-        self.assertEqual(resume_run.post(request, "k", opener=opener), "weiter")
+        self.assertEqual(resume_run.post(request, "k", opener=opener), "onward")
         return seen
 
     def test_an_open_webui_chat_resumes_through_hermes_models_with_its_key(self):

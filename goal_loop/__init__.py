@@ -1,25 +1,48 @@
-"""hermes-goal-loop — a goal loop for Hermes as a plugin (v0.3).
+"""hermes-goal-loop: a goal loop for Hermes as a plugin (v0.3).
+
+0.4.10 (z13): three owner rules.
+R1 Pause: each owner message pauses the loop (go False, a pending follow-up run is cancelled, the
+   background and owner waits are cleared, ledger ``paused_by_owner_message``). Only a message with the
+   word ``go`` as a token keeps the go ('4B 5C go', 'list ok go') or gives it again after such a pause.
+   While paused, ``pre_stop`` does not continue, no follow-up run is scheduled or injected, and the
+   background watchdog does not continue the chat. The paused turn gets a context note: answer the
+   message, put any question at the end, ask for 'go'; ``goal_go`` stays refused without a 'go' message.
+   Owner words in other languages come from the optional file ``<state dir>/vocabulary.json`` (keys
+   ``go_words`` and ``consent_patterns``); without the file only the English defaults apply.
+R2 Deferred list: ``goal_decision`` takes an optional ``goal_id``. A goal with an open linked decision,
+   or with status blocked or paused, waits for the owner; the other unfinished goals are actionable
+   (a goal that waits for a background process or a delegation is actionable later). While a goal is
+   actionable, a new decision, a ``goal_block`` and a refused ``goal_set`` change go into
+   ``state.deferred``; the answer block does not show them and the loop continues with the actionable
+   goals (also after an answer with the stop cause owner-question). When no goal is actionable, the
+   answer block shows the deferred list one time and the loop waits for the owner.
+R3 English only: all plugin texts are English. Lines that explain the loop state (wait, pause,
+   restart, follow-up run) go to the model as context, and the model writes them in the owner's
+   language at the end of its answer. ``scripts/check_english.py`` checks the tracked files.
+R4 Evidence: ``goal_decision`` requires ``evidence`` (the command or file that showed the live state,
+   and its time); without it nothing is recorded. The prompt section and the pause note tell the model
+   to check each point against the live state in this turn, and the judge accepts no evidence that
+   comes only from the chat, memory or a worker's report.
 
 0.4.9: the background watchdog does not continue while a turn of the session runs (a turn mark older
 than turn_active_max does not count) and waits background_end_grace seconds after the first tick that
 sees all awaited processes ended; '8. A', '8: A', '8 - A' close decision 8, also with a '?' in the message.
 0.4.8: an owner message closes decisions only on a number with an option, a go word or explicit consent;
 the goal block shows the numbers it closed.
-0.4.7: an owner answer closes decisions by number ('5A' closes decision 5; 'go' or an answer without a
-number closes all); the turn after a restart says that the loop is held; a watchdog continues a loop
-that waits for background processes that do not run any more (or after background_wait_max seconds);
-each resume turn writes one INFO line with its nonce and job id.
+0.4.7: an owner answer closes decisions by number ('5A' closes decision 5; 'go' alone closes all); the
+first turn after a restart says that the loop is held; a watchdog continues a loop that waits for
+background processes that do not run any more (or after background_wait_max seconds); each resume turn
+writes one INFO line with its nonce and job id.
 
 0.4.5 (r32): the stop-cause line of an answer (done, owner-question, blocker) holds the loop until
-the next owner message; an owner question does not lift an open owner decision (only go, an answer
-that names an option, or a message without a question mark does).
+the next owner message.
 
 1. Before the work: the model sets the goals (``goal_set``), each with one falsifiable check. The
    plugin appends the goal list and the go question to the answer of that turn (one time; the model
    does not repeat the list). No loop runs before ``goal_go``. **Go rule:** ``goal_go`` is accepted
-   only when an owner message came into the chat after the last ``goal_set`` of the session. The
-   ``pre_llm_call`` hook counts the owner messages (gateway notifications, subagent and cron turns
-   do not count).
+   only when an owner message with the word 'go' came into the chat after the last ``goal_set`` or
+   pause of the session. The ``pre_llm_call`` hook counts these messages (gateway notifications,
+   subagent and cron turns do not count).
 2. To the end: a generic ``pre_stop`` hook (companion fork patch) keeps the turn going while open
    goals remain. Limits (all in ``plugins.entries.goal-loop.settings``):
 
@@ -31,8 +54,7 @@ that names an option, or a message without a question mark does).
      for one goal: first a request to plan again, then a pause with an owner decision.
    - ``block_min_rounds`` (3): ``goal_block`` needs a reason and is accepted only when the same
      obstacle stays for this number of continuation rounds (Codex rule).
-   - ``stop_words``: an owner message that is one of these words pauses the loop.
-   - After a Hermes restart the loop does not continue until an owner message comes.
+   - After a Hermes restart the loop does not continue until an owner message with 'go' comes.
 
 3. The judge: ``goal_claim`` submits a structured claim; a fresh-context judge checks the real state
    read-only (see :mod:`goal_loop.judge`). Verdicts: done, wait (the goal waits without nudges),
@@ -42,9 +64,8 @@ that names an option, or a message without a question mark does).
    its evidence and the next step of a goal.
 5. Status, shown quietly (``transform_llm_output``): the full list on ``goal_set`` (with the go
    question as last line before the go), after that only goals that need the owner and new
-   decisions, each one time, and the final list one time. Labels are in the owner's language
-   (setting ``language``: ``auto``, ``de`` or ``en``). An answer that ends while goals are still open
-   gets one line: the loop is paused, write to continue.
+   decisions, each one time, and the final list one time. The labels are English; goal and decision
+   texts stay as the model wrote them.
 6. Changes after the go: ``goal_set`` is refused until an owner message approves the change;
    then the judge-confirmed goals stay done.
 
@@ -53,6 +74,7 @@ The plugin never starts a turn in an API session and never edits core files (plu
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -64,7 +86,7 @@ from typing import Any, Mapping, Optional
 
 from .claim import ClaimError, serialize_completion_claim
 from .judge import JUDGE_TASK, run_judge
-from .state import LABELS, Goal, GoalState, GoalStore, labels, owner_block, status_block
+from .state import LABELS, OWNER_STATUSES, Goal, GoalState, GoalStore, owner_block, status_block
 
 logger = logging.getLogger("goal_loop")
 
@@ -109,11 +131,12 @@ STOP_CAUSES = ("done", "owner-question", "blocker", "no-statement")
 # 0.4.5 (r32): an answer whose stop-cause line names one of these causes ends the loop until the next
 # owner message; "no-statement" lets the loop go on.
 HOLD_CAUSES = ("done", "owner-question", "blocker")
-# 0.4.5 (r32): an owner message that is one of these words answers an open owner decision (the loop
-# goes on); any other owner message (a question) keeps the decision wait.
-GO_WORDS = ("go", "weiter", "continue", "los")
+# 0.4.10 (z13): an owner message with one of these words as a token keeps or gives the go; any other
+# owner message pauses the loop. More words (other languages) come from <state dir>/vocabulary.json.
+GO_WORDS = ("go",)
+VOCABULARY_FILE = "vocabulary.json"
 _STOP_CAUSE_LINE = re.compile(
-    r"^\W*(?:stopp?[- ]?grund|stop[- ]?cause)\W*:\W*(%s)\b" % "|".join(re.escape(c) for c in STOP_CAUSES),
+    r"^\W*stop[- ]?cause\W*:\W*(%s)\b" % "|".join(re.escape(c) for c in STOP_CAUSES),
     re.IGNORECASE | re.MULTILINE)
 
 
@@ -125,38 +148,63 @@ def _stop_cause(text: Any) -> str:
     return found[-1].lower() if found else ""
 
 
-# An option answer at the start of a message: "A", "4a", "r4b A", "r32 ok", "2A, ...", "ok", "Empfehlung".
-_ANSWER_START = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D]|ok|okay|empfehlung|recommendation|"
-                           r"einverstanden|agreed)(?![\w])", re.IGNORECASE)
-_ANSWER_START_CASED = re.compile(r"^\s*(?:[\w#-]{1,8}\s+)?(?:\d{1,2}[a-dA-D]|[A-D])(?![\w])")
-
-
 # 0.4.7 (z3): a decision number with an option letter: '5A', '2b', '4 C' (not 'r4b', not 'z4 C').
 # 0.4.9 (z11): also with a separator: '8. A', '8: A', '8 - A', '8) A' (not '0.4.8 A', not '20:15 A').
 _DECISION_NUMBER = re.compile(r"(?<![\w.:])(\d{1,2})\s*(?:[.:)\-–]\s*)?[a-dA-D](?![\w])")
-# 0.4.8 (z10): explicit consent closes all open decisions ('Empfehlung', 'ok', 'alle Empfehlungen', ...).
-_CONSENT = re.compile(r"^\s*(?:(?:ja|yes|gut|passt)[\s,.!]+)?(?:alle?\s+|all\s+)?(?:deine\s+|your\s+|die\s+|the\s+)?"
-                      r"(?:empfehlung(?:en)?|recommendations?|ok(?:ay)?|einverstanden|agreed|wie\s+empfohlen|"
-                      r"as\s+recommended)(?![\w])", re.IGNORECASE)
+# 0.4.8 (z10): explicit consent closes all open decisions ('ok', 'all recommendations', ...).
+_CONSENT = re.compile(r"^\s*(?:yes[\s,.!]+)?(?:all\s+)?(?:your\s+|the\s+)?"
+                      r"(?:recommendations?|ok(?:ay)?|agreed|as\s+recommended)(?![\w])", re.IGNORECASE)
 
 
-def _close_decisions(store: "GoalStore", state: "GoalState", text: str) -> list[int]:
+def _vocabulary(base_dir: str) -> tuple[tuple[str, ...], list]:
+    """0.4.10 (z13): the go words and consent patterns: the English defaults plus the optional file
+    ``<state dir>/vocabulary.json`` ({"go_words": [...], "consent_patterns": [regex, ...]}). A consent
+    pattern matches at the start of a message. A missing or bad file gives the defaults only."""
+    words, patterns = list(GO_WORDS), [_CONSENT]
+    try:
+        with open(os.path.join(base_dir, VOCABULARY_FILE), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return tuple(words), patterns
+    if not isinstance(data, dict):
+        return tuple(words), patterns
+    for word in data.get("go_words") or []:
+        if isinstance(word, str) and word.strip() and word.strip().lower() not in words:
+            words.append(word.strip().lower())
+    for pattern in data.get("consent_patterns") or []:
+        if not isinstance(pattern, str) or not pattern.strip():
+            continue
+        try:
+            patterns.append(re.compile(r"^\s*(?:%s)(?![\w])" % pattern, re.IGNORECASE))
+        except re.error:
+            logger.debug("goal-loop vocabulary: bad consent pattern %r", pattern)
+    return tuple(words), patterns
+
+
+def _has_go(text: str, words: tuple[str, ...]) -> bool:
+    """0.4.10 (z13): the message has a go word as a token ('go', '4B 5C go', 'list ok GO')."""
+    return any(re.search(r"(?<!\w)%s(?!\w)" % re.escape(w), text or "", re.IGNORECASE) for w in words)
+
+
+def _close_decisions(store: "GoalStore", state: "GoalState", text: str,
+                      vocabulary: Optional[tuple] = None) -> list[int]:
     """0.4.8 (z10): an owner message closes decisions only on (1) a decision number with an option
-    ('6A', '1c, 2b' close those numbers), (2) a go word (closes all), or (3) explicit consent at the start
-    ('Empfehlung', 'ok', 'alle Empfehlungen'; closes all). A request, an order or a question without a
-    number ('gib mir eine Liste ...', 'zeige ...', 'was bedeutet ...?') closes none. When decisions stay
-    open, they are shown again (decisions_shown = 0). Returns the closed numbers; they are shown once in
-    the next goal block (decisions_just_closed)."""
+    ('6A', '1c, 2b' close those numbers), (2) a message that is only a go word (closes all), or (3)
+    explicit consent at the start ('ok', 'all recommendations'; closes all). A request, an order or a
+    question without a number closes none. When decisions stay open, they are shown again
+    (decisions_shown = 0). Returns the closed numbers; they are shown once in the next goal block
+    (decisions_just_closed)."""
+    words, patterns = vocabulary or _vocabulary(store.base_dir)
     open_numbers = [i for i, _ in state.open_decisions()]
     t = (text or "").strip()
     if not open_numbers or not t:
         return []
     numbers = {int(m.group(1)) for m in _DECISION_NUMBER.finditer(t)}
-    if t.lower().strip(" .!") in GO_WORDS:
+    if t.lower().strip(" .!") in words:
         close = open_numbers
     elif numbers:
         close = [i for i in open_numbers if i in numbers]
-    elif _CONSENT.match(t):
+    elif any(p.match(t) for p in patterns):
         close = open_numbers
     else:
         return []
@@ -169,26 +217,6 @@ def _close_decisions(store: "GoalStore", state: "GoalState", text: str) -> list[
         state.decisions_shown = 0  # show the decisions that stay open once more
     return close
 
-
-def _answers_decision(text: str) -> bool:
-    """0.4.5 (r32): True when an owner message answers an open decision; False for a question.
-    A go word, or a message without '?', is an answer; a message with '?' is an answer only when it
-    starts with an option (e.g. '4a', 'r4b A', 'ok', 'Empfehlung'). 'Was bedeutet Option B?' is a question."""
-    t = (text or "").strip()
-    if not t:
-        return False
-    if t.lower().strip(" .!") in GO_WORDS:
-        return True
-    if "?" not in t:
-        return True
-    if _DECISION_NUMBER.search(t):
-        return True  # 0.4.9 (z11): '8. A / 9. B ?' answers 8 and 9; the '?' does not make it a question
-    head = _ANSWER_START.match(t)
-    if not head:
-        return False
-    word = head.group(0).split()[-1].lower()
-    return word in ("ok", "okay", "empfehlung", "recommendation", "einverstanden", "agreed") or bool(
-        _ANSWER_START_CASED.match(t))
 
 # ``cron`` is the owner rule (no loop in scheduled runs). ``subagent``: a delegated child (the judge)
 # inherits the parent's conversation_id, so the loop must not drive it (F7).
@@ -211,9 +239,7 @@ DEFAULTS = {
     # 0.4.3: at plugin start a state with a go and open goals, without activity for this many days,
     # is paused (0 = off).
     "stale_days": 1,
-    "language": "auto",
     "paused_hint": True,
-    "stop_words": ["stopp", "stop", "halt", "pause", "pausiere", "abbrechen"],
     # L15 follow-up runs (owner decision 5): a run that ends after the go with open goals
     # schedules one more run of the same session; resume_max follow-up runs per go (0 = off).
     "resume": True,
@@ -238,6 +264,13 @@ FINAL_REPORT_NUDGE = (
     "owner's language: list each goal, the judge result, and the evidence."
 )
 
+# 0.4.10 (R4): evidence before claims and proposals.
+EVIDENCE_RULE = ("Before you propose options, list open points or claim a goal, check each point against "
+                 "the live state in this turn; do not rely on the chat history or memory.")
+EVIDENCE_MIN = 12
+EVIDENCE_REFUSED = ("error: goal_decision refused: examine the live state first and pass the result as "
+                    "evidence (the command or file that showed it, and its time). Nothing was recorded.")
+
 USAGE_HINT = (
     "Goal loop: for a multi-step task, first call goal_set with the goals, each with one "
     "falsifiable check. Write goal text and check in the language that the owner mostly uses in "
@@ -247,14 +280,15 @@ USAGE_HINT = (
     "submit the claim, so no check on a later chat report; (3) name the version that runs live as "
     "the base. Split a large goal into smaller goals. The plugin appends the goal list and the go "
     "question to your answer: do not repeat the list and do not ask for the go yourself. Call "
-    "goal_go only after the owner gave the go in a new message. Record progress with "
-    "goal_progress."
+    "goal_go only after the owner wrote 'go' in a new message. Each other owner message pauses the "
+    "loop: answer it and ask for 'go'. Record progress with goal_progress. If a goal needs the owner, "
+    "record a goal_decision with its goal_id and continue with the other goals. " + EVIDENCE_RULE
 )
 
 GO_REFUSED = (
-    "error: goal_go refused: no owner message came after the last goal_set or pause. End your "
-    "turn; the plugin shows the goal list and the go question. Call goal_go only in the turn that "
-    "answers the owner's go. The loop does not start."
+    "error: goal_go refused: no owner message with the word 'go' came after the last goal_set or "
+    "pause. End your turn; the plugin shows the goal list and the go question. Call goal_go only in "
+    "the turn that answers the owner's go. The loop does not start."
 )
 
 CHANGE_REFUSED = (
@@ -263,14 +297,20 @@ CHANGE_REFUSED = (
     "the turn that answers the owner's approval. Judge-confirmed goals stay done."
 )
 
+CHANGE_DEFERRED = (
+    "goal_set refused: the owner gave the go for the current goal list. The change is recorded in the "
+    "deferred list; the owner sees it when no goal can be worked. Do not ask the owner now; continue "
+    "with goal(s) {ids}."
+)
+
 GOAL_STATUS_DESCRIPTION = (
     "Return the goal list with each goal's check and status as finished text. Give the returned "
     "text to the owner unchanged, word for word: do not summarize, shorten, reorder or reformat it."
 )
 
 PROMPT_SECTION_ID = "goal-loop"
-# Shown before the block when the model turn is empty (labels per language in state.LABELS).
-NO_REPORT_MARKER = labels("en")["no_report"]
+# Shown before the block when the model turn is empty.
+NO_REPORT_MARKER = LABELS["no_report"]
 
 _INTERNAL_FOOTER_PREFIX = "[INTERNAL NOTIFICATION"
 _STEER_DISPLAY_KIND = "steer"
@@ -297,13 +337,6 @@ _MUTATING_COMMAND = re.compile(
 )
 # conversation_id -> parent session_id while a judge runs (L12)
 _JUDGE_PARENTS: dict[str, str] = {}
-
-_DE_WORDS = frozenset("und der die das ist nicht ich du mit für auf bitte sind wie was zu ein eine "
-                      "dann noch auch schon oder wir ihr mir dir sollen soll kann muss wenn aber "
-                      "jetzt hier gibt".split())
-_EN_WORDS = frozenset("the and is not you with for please are what to a then also or this that "
-                      "we they me can must should if but now here there".split())
-
 
 def _state_dir() -> str:
     """The goal-state folder: GOAL_LOOP_STATE_DIR, else $HERMES_HOME/goal-loop (F8)."""
@@ -339,89 +372,54 @@ def _gate_for(store: "GoalStore", session_id: Any, conversation_id: Any = "") ->
     return store.chat_for_session(sid) or _chat_key(sid)
 
 
-def detect_language(text: str) -> str:
-    """'de', 'en' or '' (no clear vote) for one owner message."""
-    words = re.findall(r"[a-zäöüß]+", (text or "").lower())
-    de = sum(1 for w in words if w in _DE_WORDS) + 2 * len(re.findall(r"[äöüß]", text.lower()))
-    en = sum(1 for w in words if w in _EN_WORDS)
-    if max(de, en) < 2 or de == en:
-        return ""
-    return "de" if de > en else "en"
-
-
 def _similar(a: str, b: str) -> bool:
     """Two rejection reasons name the same problem (word overlap of at least one half)."""
-    wa = set(re.findall(r"[a-z0-9äöüß_./-]{3,}", (a or "").lower()))
-    wb = set(re.findall(r"[a-z0-9äöüß_./-]{3,}", (b or "").lower()))
+    wa = set(re.findall(r"[\w./-]{3,}", (a or "").lower()))
+    wb = set(re.findall(r"[\w./-]{3,}", (b or "").lower()))
     if not wa or not wb:
         return False
     return len(wa & wb) / len(wa | wb) >= 0.5
 
 
 DECISION_TEXT = {
-    "de": {
-        "budget": ("Ziel {gid} hat das Budget von {n} Fortsetzungen erreicht und ist pausiert. "
-                   "Optionen: A) weitermachen mit {n} neuen Fortsetzungen (antworte mit 'go'); "
-                   "B) das Ziel ändern; C) das Ziel streichen. Empfehlung: B, wenn die letzten "
-                   "Ablehnungen denselben Grund nennen, sonst A."),
-        "idle": ("Der Loop hat {n} Fortsetzungen in Folge ohne Werkzeugaufruf gemacht und ist "
-                 "pausiert (Ziele: {gids}). Optionen: A) weitermachen (antworte mit 'go'); B) die "
-                 "Ziele ändern; C) die Ziele streichen. Empfehlung: B, weil Leerlauf meist ein "
-                 "unklares oder blockiertes Ziel zeigt."),
-        "reject": ("Ziel {gid} wurde {n}-mal mit demselben Grund abgelehnt und ist pausiert: {why}. "
-                   "Optionen: A) weitermachen (antworte mit 'go'); B) Ziel oder Prüfung ändern; "
-                   "C) das Ziel streichen. Empfehlung: B, weil derselbe Weg {n}-mal gescheitert ist."),
-        "paused_line": "Der Loop ist pausiert: {n} Ziel(e) sind offen ({gids}). Schreibe 'weiter', "
-                       "damit er fortfährt.",
-        "owner_stop": "Der Loop ist auf deinen Wunsch pausiert. Mit 'go' geht es weiter.",
-        "restart_line": ("Neustart: Schleife angehalten, schreib weiter, damit sie fortfährt "
-                         "({n} Ziel(e) offen: {gids})."),
-        "resume_line": ("Der Loop läuft in {delay} in einem Folge-Run weiter: {n} Ziel(e) offen "
-                        "({gids}). Die Antwort erscheint in diesem Chat. Mit 'stopp' hältst du ihn an."),
-        "wait_line": ("Der Loop wartet ({why}): {n} Ziel(e) offen ({gids}). Er läuft weiter, "
-                      "sobald das Ergebnis da ist oder du antwortest."),
-        "inject_line": ("Der Loop läuft gleich in diesem Chat weiter: {n} Ziel(e) offen ({gids}). "
-                        "Mit 'stopp' hältst du ihn an."),
-        "stale": ("Der Loop war {days} Tage ohne Aktivität und ist pausiert (Ziele: {gids}). "
-                  "Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele ändern; C) die Ziele "
-                  "streichen. Empfehlung: B, wenn die Ziele veraltet sein können, sonst A."),
-        "resume_max": ("Der Loop hat {n} Folge-Runs ohne Abschluss gemacht und ist pausiert "
-                       "(Ziele: {gids}). Optionen: A) weitermachen (antworte mit 'go'); B) die Ziele "
-                       "ändern; C) die Ziele streichen. Empfehlung: A, wenn die Ziele Fortschritt zeigen."),
-    },
-    "en": {
-        "budget": ("Goal {gid} reached the budget of {n} continuations and is paused. Options: "
-                   "A) continue with {n} new continuations (answer 'go'); B) change the goal; "
-                   "C) remove the goal. Recommendation: B if the last rejections give the same "
-                   "reason, else A."),
-        "idle": ("The loop made {n} continuations in a row without a tool call and is paused "
-                 "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
-                 "C) remove the goals. Recommendation: B, because idle turns usually show an "
-                 "unclear or blocked goal."),
-        "reject": ("Goal {gid} was rejected {n} times for the same reason and is paused: {why}. "
-                   "Options: A) continue (answer 'go'); B) change the goal or its check; C) remove "
-                   "the goal. Recommendation: B, because the same way failed {n} times."),
-        "paused_line": "The loop is paused: {n} goal(s) are open ({gids}). Write 'continue' to go on.",
-        "owner_stop": "The loop is paused as you asked. Answer 'go' to continue.",
-        "restart_line": ("Restart: loop held, write 'continue' to go on ({n} goal(s) open: {gids})."),
-        "resume_line": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open "
-                        "({gids}). The answer appears in this chat. Write 'stop' to halt it."),
-        "wait_line": ("The loop waits ({why}): {n} goal(s) open ({gids}). It goes on when the result "
-                      "is there or when you answer."),
-        "inject_line": ("The loop continues in this chat now: {n} goal(s) open ({gids}). "
-                        "Write 'stop' to halt it."),
-        "stale": ("The loop had no activity for {days} days and is paused (goals: {gids}). "
-                  "Options: A) continue (answer 'go'); B) change the goals; C) remove the goals. "
-                  "Recommendation: B if the goals can be out of date, else A."),
-        "resume_max": ("The loop made {n} follow-up runs without completion and is paused "
-                       "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
-                       "C) remove the goals. Recommendation: A if the goals show progress."),
-    },
+    "budget": ("Goal {gid} reached the budget of {n} continuations and is paused. Options: "
+               "A) continue with {n} new continuations (answer 'go'); B) change the goal; "
+               "C) remove the goal. Recommendation: B if the last rejections give the same "
+               "reason, else A."),
+    "idle": ("The loop made {n} continuations in a row without a tool call and is paused "
+             "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
+             "C) remove the goals. Recommendation: B, because idle turns usually show an "
+             "unclear or blocked goal."),
+    "reject": ("Goal {gid} was rejected {n} times for the same reason and is paused: {why}. "
+               "Options: A) continue (answer 'go'); B) change the goal or its check; C) remove "
+               "the goal. Recommendation: B, because the same way failed {n} times."),
+    "stale": ("The loop had no activity for {days} days and is paused (goals: {gids}). "
+              "Options: A) continue (answer 'go'); B) change the goals; C) remove the goals. "
+              "Recommendation: B if the goals can be out of date, else A."),
+    "resume_max": ("The loop made {n} follow-up runs without completion and is paused "
+                   "(goals: {gids}). Options: A) continue (answer 'go'); B) change the goals; "
+                   "C) remove the goals. Recommendation: A if the goals show progress."),
 }
 
-
-def _dtext(language: str) -> dict:
-    return DECISION_TEXT.get(language or "en", DECISION_TEXT["en"])
+# 0.4.10 (z13): the loop state after a turn, for the model (context of the next turn), not for the chat.
+LOOP_NOTES = {
+    "paused": "The loop is paused: {n} goal(s) are open ({gids}). The owner writes 'go' to continue it.",
+    "resume": ("The loop continues in {delay} in a follow-up run: {n} goal(s) open ({gids}). The answer "
+               "appears in this chat. Any owner message pauses it."),
+    "wait": ("The loop waits ({why}): {n} goal(s) open ({gids}). It goes on when the result is there; "
+             "any owner message pauses it."),
+    "inject": "The loop continues in this chat now: {n} goal(s) open ({gids}). Any owner message pauses it.",
+}
+_LOOP_NOTE_LEAD = ("[goal-loop] Loop state (write this in the owner's language at the end of your "
+                   "answer, in one short line): ")
+RESTART_NOTE = ("[goal-loop] Hermes restarted: the goal loop is held ({n} goal(s) open: {gids}). Write "
+                "this in the owner's language at the end of your answer: the loop is held after a "
+                "restart, and the owner writes 'go' to continue it. Do not call goal_go yourself.")
+PAUSE_NOTE = ("[goal-loop] This owner message paused the goal loop ({n} goal(s) open: {gids}). Only a "
+              "message with the word 'go' continues it. Answer the owner's message now. Put any question "
+              "to the owner at the end of your answer. Then, at the end of your answer, ask the owner to "
+              "write 'go' to continue the loop; write this in the owner's language. Do not call goal_go "
+              "yourself: it is refused until the owner writes 'go'.")
 
 
 class Settings:
@@ -452,11 +450,21 @@ class Settings:
         return value if value is not None else default
 
 
-def _language(state: GoalState, store: GoalStore, settings: Settings, session_id: str = "") -> str:
-    fixed = str(settings.get("language") or "auto").lower()
-    if fixed in ("de", "en"):
-        return fixed
-    return state.language or store.session_language(session_id) or "en"
+def _actionable(state: GoalState) -> list[Goal]:
+    """0.4.10 (R2): the goals that the loop can still work on after the go (not owner-bound)."""
+    return state.free_goals() if state.go else []
+
+
+def _ids(goals: list[Goal]) -> str:
+    return ", ".join(g.id for g in goals)
+
+
+def _defer(state: GoalState, kind: str, text: str, goal_id: str = "", number: int = 0) -> None:
+    """0.4.10 (R2): hold an owner item back until no goal can be worked (one entry per item)."""
+    if any(e.get("kind") == kind and e.get("text") == text and not e.get("shown") for e in state.deferred):
+        return
+    state.deferred.append({"ts": round(time.time(), 3), "kind": kind, "text": text,
+                           "goal_id": goal_id, "number": number, "shown": False})
 
 
 def _pause(store: GoalStore, state: GoalState, goals: list[Goal], reason: str, decision: str,
@@ -550,8 +558,13 @@ _GOAL_DECISION_SCHEMA = {
     "properties": {
         "text": {"type": "string",
                  "description": "the decision with options and a recommendation, in the owner's language"},
+        "goal_id": {"type": "string",
+                    "description": "optional: the goal that waits for this decision (the loop goes on with the others)"},
+        "evidence": {"type": "string",
+                     "description": ("the command or file that showed the live state in this turn, and its "
+                                     "time (required; the chat history or memory is no evidence)")},
     },
-    "required": ["text"],
+    "required": ["text", "evidence"],
 }
 
 _GOAL_BLOCK_SCHEMA = {
@@ -613,14 +626,19 @@ class _Tools:
             seen.add(gid)
             goals.append(Goal(id=gid, text=text, check=check))
         # a list with unfinished goals after the go is a change; a finished list starts fresh
-        change = state.go and bool(state.unfinished())
+        change = (state.go or state.owner_paused) and bool(state.unfinished())
         if change:
             # L3: after the go, a changed list needs the owner's approval in a new message.
             count = self.store.gate_count(session, "change")
             if not count:
                 if count is None:
                     self.store.open_gate(session, "change")
-                self.store.append_ledger(state.chat_key, "change_refused")
+                free = _actionable(state)
+                self.store.append_ledger(state.chat_key, "change_refused", deferred=bool(free))
+                if free:
+                    _defer(state, "change", "; ".join(f"{g.id}: {g.text} (check: {g.check})" for g in goals))
+                    self.store.save(state)
+                    return CHANGE_DEFERRED.format(ids=_ids(free))
                 return CHANGE_REFUSED
             self.store.close_gate(session, "change")
             old = {g.id: g for g in state.goals}
@@ -635,12 +653,17 @@ class _Tools:
         state.goals = goals
         if change:
             _lift_decision_wait(self.store, state, "change_approved")  # 0.4.5 (r32)
+            for entry in state.deferred:
+                if entry.get("kind") == "change":
+                    entry["shown"] = True
         state.continuations = 0
         state.list_changed = True
         state.final_shown = False
-        state.language = self.store.session_language(session) or state.language
         if not change:
             state.go = False
+            state.owner_paused = False
+            state.deferred = []
+            state.decision_goals = {}
             state.idle_nudges = 0
             self.store.open_gate(session)
         self.store.append_ledger(state.chat_key, "goals_changed" if change else "goals_set",
@@ -674,6 +697,7 @@ class _Tools:
             goal.rejects = 0
             goal.last_reject = ""
         state.go = True
+        state.owner_paused = False
         state.idle_nudges = 0
         state.tool_calls_at_nudge = -1
         state.decisions_at_nudge = len(state.decisions)  # 0.4.3: base of the owner wait
@@ -687,18 +711,35 @@ class _Tools:
 
     def goal_status(self, args: dict[str, Any], **kwargs: Any) -> str:
         state = self._load(kwargs)
-        block = status_block(state, _language(state, self.store, self.settings, state.chat_key))
+        block = status_block(state)
         return block.lstrip("\n-") if block else "No goals set."
 
     def goal_decision(self, args: dict[str, Any], **kwargs: Any) -> str:
-        state = self._load(kwargs)
         text = str(args.get("text") or "").strip()
         if not text:
             return "error: decision text is required"
+        evidence = str(args.get("evidence") or "").strip()
+        if len(evidence) < EVIDENCE_MIN:
+            return EVIDENCE_REFUSED  # 0.4.10 (R4): nothing is recorded
+        state = self._load(kwargs)
+        gid = str(args.get("goal_id") or "").strip()
+        goal = state.goal(gid) if gid else None
+        if gid and (goal is None or goal.done):
+            return f"error: unknown or finished goal_id {gid!r}"
         state.decisions.append(text)
-        self.store.append_ledger(state.chat_key, "decision", text=text[:200], number=len(state.decisions))
+        number = len(state.decisions)
+        if goal is not None:
+            state.decision_goals[str(number)] = goal.id
+        free = _actionable(state)
+        self.store.append_ledger(state.chat_key, "decision", text=text[:200], number=number, goal_id=gid,
+                                 evidence=evidence[:200], deferred=bool(free))
+        if free:
+            _defer(state, "decision", text, goal_id=gid, number=number)
+            self.store.save(state)
+            return (f"Decision {number} recorded in the deferred list; the owner sees it when no goal can "
+                    f"be worked. Do not ask the owner now; continue with goal(s) {_ids(free)}.")
         self.store.save(state)
-        return (f"Decision {len(state.decisions)} recorded ({len(state.open_decisions())} open). "
+        return (f"Decision {number} recorded ({len(state.open_decisions())} open). "
                 "It will appear in the decision list.")
 
     def goal_block(self, args: dict[str, Any], **kwargs: Any) -> str:
@@ -730,8 +771,14 @@ class _Tools:
         goal.status = "blocked"
         goal.note = reason
         goal.block_shown = shown_before
+        free = _actionable(state)
         self.store.append_ledger(state.chat_key, "blocked", goal_id=goal.id, reason=reason[:200],
-                                 shown_again=not shown_before)
+                                 shown_again=not shown_before, deferred=bool(free))
+        if free:
+            _defer(state, "block", reason, goal_id=goal.id)
+            self.store.save(state)
+            return (f"Goal {goal.id} marked blocked and recorded in the deferred list; the owner sees it "
+                    f"when no goal can be worked. Do not ask the owner now; continue with goal(s) {_ids(free)}.")
         self.store.save(state)
         return f"Goal {goal.id} marked blocked. The loop will not retry it."
 
@@ -816,10 +863,9 @@ class _Tools:
                                  reason=verdict.reason[:200], method=verdict.method,
                                  similar=goal.rejects)
         reply = f"Goal {goal.id} rejected by the judge. Missing: {verdict.reason}."
-        lang = _language(state, self.store, self.settings, state.chat_key)
         if goal.rejects >= self.settings.get("reject_pause_after") > 0:
             _pause(self.store, state, [goal], verdict.reason,
-                   _dtext(lang)["reject"].format(gid=goal.id, n=goal.rejects, why=verdict.reason),
+                   DECISION_TEXT["reject"].format(gid=goal.id, n=goal.rejects, why=verdict.reason),
                    state.chat_key, "paused_rejects")
             reply += " The same reason came again; the goal is paused for an owner decision."
         elif goal.rejects >= self.settings.get("reject_replan_after") > 0:
@@ -1095,6 +1141,10 @@ def _note_stop_cause(store: GoalStore, state: GoalState, text: Any) -> str:
     cause = _stop_cause(text)
     if cause not in HOLD_CAUSES or not state.open_goals():
         return cause
+    if cause == "owner-question" and state.go:
+        # 0.4.10 (R2): open goals can still be worked; the question goes to the deferred list.
+        store.append_ledger(state.chat_key, "owner_question_not_held", open=[g.id for g in state.open_goals()])
+        return cause
     if state.stop_hold != cause:
         state.stop_hold = cause
         store.append_ledger(state.chat_key, "stop_cause_hold", cause=cause,
@@ -1115,13 +1165,12 @@ def _lift_decision_wait(store: GoalStore, state: GoalState, why: str) -> None:
 
 
 _WAIT_TEXT = {
-    "yield_builtin_goal": ("Hermes' own /goal is active", "Hermes' eigenes /goal ist aktiv"),
-    "waiting_background": ("a background process is running", "ein Hintergrundprozess läuft"),
-    "waiting_delegation": ("a delegated task is running", "eine delegierte Aufgabe läuft"),
-    "waiting_owner": ("all open goals wait for your decision", "alle offenen Ziele warten auf deine Entscheidung"),
-    "waiting_stop_cause": ("the answer ended with a stop cause for you", "die Antwort endete mit einem Stopp-Grund für dich"),
-    "waiting_decision": ("an open decision waits for your answer or 'go'; a question does not restart it",
-                         "eine offene Entscheidung wartet auf deine Antwort oder 'go'; eine Rückfrage startet ihn nicht"),
+    "yield_builtin_goal": "Hermes' own /goal is active",
+    "waiting_background": "a background process is running",
+    "waiting_delegation": "a delegated task is running",
+    "waiting_owner": "all open goals wait for the owner's decision",
+    "waiting_stop_cause": "the answer ended with a stop cause for the owner",
+    "waiting_decision": "an open decision waits for the owner's answer with 'go'",
 }
 
 
@@ -1136,9 +1185,9 @@ def _wait_note(store: GoalStore, state: GoalState, reason: str) -> None:
 
 # --- The pre_stop hook ------------------------------------------------------------------------
 
-def _goal_context(state: GoalState, lead: str) -> str:
+def _goal_context(state: GoalState, lead: str, goals: Optional[list[Goal]] = None) -> str:
     lines = [lead]
-    for goal in state.unfinished():
+    for goal in (state.unfinished() if goals is None else goals):
         line = f"- {goal.id} [{goal.status}]: {goal.text} | check: {goal.check}"
         if goal.judge_reason and goal.status == "in_work":
             line += f" | last rejection: {goal.judge_reason}"
@@ -1151,17 +1200,19 @@ def _goal_context(state: GoalState, lead: str) -> str:
     return "\n".join(lines)
 
 
-def _apply_owner_stop(store: GoalStore, state: GoalState, key: str, lang: str) -> None:
-    """L8: the owner wrote a stop word: take the go back, cancel a pending follow-up run, record
-    it. Runs at the owner message (pre_llm_call) and again in pre_stop, at most 1 time per stop."""
-    store.close_gate(key, "stop")
-    if not state.go:
-        return
+def _pause_by_owner(store: GoalStore, state: GoalState, gate: str) -> None:
+    """0.4.10 (R1): an owner message without 'go' takes the go back, cancels a pending follow-up run,
+    clears the waits and opens the go gate (only a later 'go' message counts)."""
     state.go = False
+    state.owner_paused = True
     _cancel_follow_up(store, state.chat_key)
-    state.decisions.append(_dtext(lang)["owner_stop"])
-    store.append_ledger(state.chat_key, "paused_by_owner")
-    store.open_gate(key)
+    state.bg_wait = {}
+    state.wait_reason = ""
+    state.stop_hold = ""
+    state.decision_wait = False
+    state.decisions_at_nudge = len(state.decisions)
+    store.append_ledger(state.chat_key, "paused_by_owner_message", open=[g.id for g in state.unfinished()])
+    store.open_gate(gate)
     store.save(state)
 
 
@@ -1183,11 +1234,6 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             return None
         if not state.go or not state.goals:
             return None
-        lang = _language(state, store, settings, key)
-        # L8: the owner asked to stop.
-        if store.gate_count(key, "stop") is not None:
-            _apply_owner_stop(store, state, key, lang)
-            return None
         # L13: after a restart only an owner message of this process re-arms the loop.
         if state.boot_id != BOOT_ID:
             if store.gate_count(key, f"boot{BOOT_ID[:12]}") is None:
@@ -1199,7 +1245,7 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             store.save(state)
             return None
         # 0.4.5 (r32): the stop-cause line of this answer.
-        _note_stop_cause(store, state, final_response)
+        cause = _note_stop_cause(store, state, final_response)
         # 0.4.3: no push while Hermes work or the owner is awaited (the end of that work, or an owner
         # message, starts the next turn, and this hook runs again then).
         why = _wait_reason(state, session_id)
@@ -1231,7 +1277,7 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
         if idle_pause and state.idle_nudges >= idle_pause:
             gids = ", ".join(g.id for g in open_goals)
             _pause(store, state, open_goals, "no tool call in a row",
-                   _dtext(lang)["idle"].format(n=state.idle_nudges, gids=gids), key,
+                   DECISION_TEXT["idle"].format(n=state.idle_nudges, gids=gids), key,
                    "paused_idle")
             store.save(state)
             return None
@@ -1244,14 +1290,14 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
                 over.append(goal)
         for goal in over:
             _pause(store, state, [goal], f"budget of {budget} continuations reached",
-                   _dtext(lang)["budget"].format(gid=goal.id, n=budget), key,
+                   DECISION_TEXT["budget"].format(gid=goal.id, n=budget), key,
                    "paused_budget")
         open_goals = state.open_goals()
         store.save(state)
         if not open_goals:
             return None
         message = _goal_context(state, f"[goal-loop] {len(open_goals)} goal(s) are still open. "
-                                       "Continue the work on these goals:")
+                                       "Continue the work on these goals:", open_goals)
         replan = settings.get("idle_replan_after")
         if replan and state.idle_nudges >= replan:
             message += ("\nThe last continuations had no tool call. Plan again: name a different "
@@ -1263,6 +1309,14 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
             "stays. End your message with a stop-cause line, one of: "
             f"{', '.join(STOP_CAUSES)}."
         )
+        free = _ids(open_goals)
+        bound = [g for g in state.unfinished() if state.owner_bound(g)]
+        if bound:
+            message += (f"\nGoal(s) {_ids(bound)} wait for the owner (deferred list). Do not ask the owner "
+                        f"now; continue with {free}.")
+        if cause == "owner-question":
+            message += (f"\nYour answer ended with the stop cause owner-question, but goal(s) {free} can "
+                        f"still be worked: record the question with goal_decision and continue with {free}.")
         return {"action": "continue", "message": message}
 
     return _pre_stop
@@ -1270,29 +1324,42 @@ def make_pre_stop(store: GoalStore, settings: Optional[Settings] = None):
 
 # --- The status display (transform_llm_output) -------------------------------------------------
 
-def _display_block(state: GoalState, language: str = "en") -> str:
-    """Decide what this turn's answer shows and record it as shown (the caller saves the state)."""
+def _display_block(state: GoalState) -> str:
+    """Decide what this turn's answer shows and record it as shown (the caller saves the state).
+    0.4.10 (R2): deferred items stay hidden while a goal can be worked; when none can, they are shown
+    one time."""
     if state.list_changed:
         state.mark_all_shown()
         state.final_shown = state.all_done()
-        return status_block(state, language, go_question=not state.go)
+        return status_block(state, go_question=not state.go)
     if state.all_done():
         if not state.final_shown:
             state.final_shown = True
             state.mark_all_shown()
-            return status_block(state, language)
+            return status_block(state)
         # goal-loop-quiet decision 4a: a decision recorded after the final list still shows once
+    free = bool(_actionable(state))
+    pending = [e for e in state.deferred if not e.get("shown")]
+    held_numbers = {int(e.get("number") or 0) for e in pending if e.get("kind") == "decision"}
+    held_goals = {str(e.get("goal_id") or "") for e in pending if e.get("kind") == "block"}
     owner_goals = [g for g in state.goals
-                   if g.status in ("blocked", "paused") and not g.done and not g.block_shown]
+                   if g.status in OWNER_STATUSES and not g.done and not g.block_shown
+                   and not (free and g.id in held_goals)]
     start = min(max(state.decisions_shown, 0), len(state.decisions))
-    decisions = [(index, text) for index, text in state.open_decisions() if index > start]
+    decisions = [(index, text) for index, text in state.open_decisions()
+                 if (index > start or (not free and index in held_numbers))
+                 and not (free and index in held_numbers)]
+    changes = [] if free else [str(e.get("text") or "") for e in pending if e.get("kind") == "change"]
+    if not free:
+        for entry in pending:
+            entry["shown"] = True
     closed, state.decisions_just_closed = list(state.decisions_just_closed), []  # 0.4.8 (z10): show once
-    if not owner_goals and not decisions and not closed:
+    if not owner_goals and not decisions and not closed and not changes:
         return ""
     for goal in owner_goals:
         goal.block_shown = True
     state.decisions_shown = len(state.decisions)
-    return owner_block(owner_goals, decisions, language, closed=closed)
+    return owner_block(owner_goals, decisions, closed=closed, changes=changes)
 
 
 def _cancel_follow_up(store: GoalStore, chat_key: str) -> None:
@@ -1359,9 +1426,8 @@ def _inject_follow_up(store: GoalStore, state: GoalState, settings: Settings,
     if idle_pause and state.idle_resumes >= idle_pause:
         open_goals = state.open_goals()
         gids = ", ".join(g.id for g in open_goals)
-        lang = _language(state, store, settings, state.chat_key)
         _pause(store, state, open_goals, "follow-up runs in a row without a tool call",
-               _dtext(lang)["idle"].format(n=state.idle_resumes, gids=gids), state.chat_key,
+               DECISION_TEXT["idle"].format(n=state.idle_resumes, gids=gids), state.chat_key,
                "paused_idle")
         store.save(state)
         return False
@@ -1400,76 +1466,64 @@ def make_transform_llm_output(store: GoalStore, settings: Optional[Settings] = N
             return None
         if not state.goals:
             return None
-        lang = _language(state, store, settings, state.chat_key)
         limit = settings.get("resume_max")
         waiting = state.open_goals() if state.go else []
         if waiting and settings.get("resume") and limit and state.resumes >= limit:
-            gids = ", ".join(g.id for g in waiting)
             _pause(store, state, waiting, f"{state.resumes} follow-up runs without completion",
-                   _dtext(lang)["resume_max"].format(n=state.resumes, gids=gids), state.chat_key,
+                   DECISION_TEXT["resume_max"].format(n=state.resumes, gids=_ids(waiting)), state.chat_key,
                    "paused_resume_max")
-        block = _display_block(state, lang)
+        block = _display_block(state)
         # L15: the turn ends while goals are still open after the go. L13: a state that a
         # different process drove is held after a restart, so it gets no follow-up run either.
         held = bool(state.boot_id) and state.boot_id != BOOT_ID
         open_goals = state.open_goals() if state.go and not held else []
-        tail = ""
         if open_goals:
             _note_stop_cause(store, state, body)  # 0.4.5 (r32): also when pre_stop did not run
         why = _wait_reason(state, session_id) if open_goals else ""
         if why == "waiting_owner" and not state.decision_wait:
             state.decision_wait = True  # 0.4.5 (r32)
             store.append_ledger(state.chat_key, "decision_wait", decisions=len(state.decisions))
+        gids, n = _ids(open_goals), len(open_goals)
+        note = ""
         if why:
             _wait_note(store, state, why)
             if why == "waiting_background":
                 _note_background(state, session_id, platform)  # 0.4.7 (z5)
-            tail = "\n\n" + _dtext(lang)["wait_line"].format(
-                why=_WAIT_TEXT[why][1 if lang == "de" else 0], n=len(open_goals),
-                gids=", ".join(g.id for g in open_goals))
+            note = LOOP_NOTES["wait"].format(why=_WAIT_TEXT[why], n=n, gids=gids)
         elif open_goals and platform == "api_server" and _schedule_follow_up(store, state, settings,
                                                                             session_id):
-            tail = "\n\n" + _dtext(lang)["resume_line"].format(
-                n=len(open_goals), gids=", ".join(g.id for g in open_goals),
-                delay=settings.get("resume_delay"))
+            note = LOOP_NOTES["resume"].format(n=n, gids=gids, delay=settings.get("resume_delay"))
         elif open_goals and _inject_follow_up(store, state, settings, platform, session_id):
             # Issue #1: a local chat (also after a turn cut at the iteration limit) continues.
-            tail = "\n\n" + _dtext(lang)["inject_line"].format(
-                n=len(open_goals), gids=", ".join(g.id for g in open_goals))
+            note = LOOP_NOTES["inject"].format(n=n, gids=gids)
         elif open_goals and settings.get("paused_hint"):
-            tail = "\n\n" + _dtext(lang)["paused_line"].format(
-                n=len(open_goals), gids=", ".join(g.id for g in open_goals))
-        if held and state.go and state.unfinished() and state.restart_note_boot != BOOT_ID:
-            # 0.4.7 (z4): the first answer after a restart says that the loop is held (rule L13).
-            state.restart_note_boot = BOOT_ID
-            store.append_ledger(state.chat_key, "restart_hold_note",
-                                open=[g.id for g in state.unfinished()])
-            tail += "\n\n" + _dtext(lang)["restart_line"].format(
-                n=len(state.unfinished()), gids=", ".join(g.id for g in state.unfinished()))
-        if not block and not tail:
+            note = LOOP_NOTES["paused"].format(n=n, gids=gids)
+        # 0.4.10 (R3): the loop state goes to the model as context of the next turn, not into this answer.
+        changed = bool(block or open_goals) or note != state.loop_note
+        state.loop_note = note
+        if changed:
+            try:
+                store.save(state)
+            except Exception:
+                logger.debug("goal display state save failed", exc_info=True)
+        if not block:
             return None
-        try:
-            store.save(state)
-        except Exception:
-            logger.debug("goal display state save failed", exc_info=True)
-        if block:
-            # One goal block per answer: the model imitates the stored plugin blocks of earlier turns.
-            body = strip_model_blocks(body, go_question=_GO_LINE.search(block) is not None)
+        # One goal block per answer: the model imitates the stored plugin blocks of earlier turns.
+        body = strip_model_blocks(body, go_question=_GO_LINE.search(block) is not None)
         if not body.strip():
-            body = labels(lang)["no_report"]
-        return body + tail + ("\n" + block if block else "")
+            body = LABELS["no_report"]
+        return body + "\n" + block
 
     return _transform
 
 
-# Lines of a goal block that the model wrote itself (all languages of state.LABELS).
-_TITLE_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(
-    re.escape(lab[key]) for lab in LABELS.values() for key in ("title", "title_owner")))
-_DECISIONS_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(re.escape(lab["decisions"]) for lab in LABELS.values()))
+# Lines of a goal block that the model wrote itself (labels of state.LABELS).
+_TITLE_LINE = re.compile(r"^\s*(%s)\s*$" % "|".join(re.escape(LABELS[key]) for key in ("title", "title_owner")))
+_DECISIONS_LINE = re.compile(r"^\s*(%s)\s*$" % re.escape(LABELS["decisions"]))
 _GOAL_LINE = re.compile(r"^\s*- \[[ xX]\] \S+:")
 _NUMBERED_LINE = re.compile(r"^\s*\d+\.\s")
-_GO_LINE = re.compile(r"^\s*(%s|Reply \W?go\W? to start\.?|Antworte mit \W?go\W?.*)\s*$" % "|".join(
-    re.escape(lab["go_question"]) for lab in LABELS.values()), re.IGNORECASE | re.MULTILINE)
+_GO_LINE = re.compile(r"^\s*(%s|Reply \W?go\W? to start\.?)\s*$" % re.escape(LABELS["go_question"]),
+                      re.IGNORECASE | re.MULTILINE)
 
 
 def strip_model_blocks(body: str, go_question: bool = False) -> str:
@@ -1506,7 +1560,7 @@ def strip_model_blocks(body: str, go_question: bool = False) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).rstrip()
 
 
-# --- The go gate, stop words, language and goal context (pre_llm_call) ------------------------
+# --- The go gate, the owner pause and the goal context (pre_llm_call) -------------------------
 
 def _message_text(message: Any) -> str:
     if isinstance(message, str):
@@ -1640,9 +1694,31 @@ def resume_after_restart(store: GoalStore, settings: Settings) -> list:
         delay=str(settings.get("restart_resume_delay") or "2m"))
 
 
+_GOALS_LEAD = ("[goal-loop] Goals of this chat at {time} (owner-approved; a newer goal list wins; "
+               "do not change them without the owner):")
+LOOP_HINT = ("[goal-loop] At the end of your answer, write one short line in the owner's language: the loop "
+             "goes on by itself while goals are open, and any owner message without 'go' pauses it.")
+
+
+def _restart_note(store: GoalStore, state: GoalState) -> str:
+    """0.4.7 (z4): the first turn after a restart that finds the loop held gets the restart note."""
+    held = bool(state.boot_id) and state.boot_id != BOOT_ID
+    if not (held and state.go and state.unfinished() and state.restart_note_boot != BOOT_ID):
+        return ""
+    state.restart_note_boot = BOOT_ID
+    store.append_ledger(state.chat_key, "restart_hold_note", open=[g.id for g in state.unfinished()])
+    store.save(state)
+    return "\n\n" + RESTART_NOTE.format(n=len(state.unfinished()), gids=_ids(state.unfinished()))
+
+
+def _goals_context(state: GoalState) -> str:
+    return _goal_context(state, _GOALS_LEAD.format(time=time.strftime("%H:%M")))
+
+
 def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
-    """For each owner message: count it for the go and change gates, mark it for this process
-    (L13), detect a stop word (L8) and the language (O2), and return the goal context (L4)."""
+    """For each owner message: count a 'go' message for the go gate and each message for the change
+    gate, mark it for this process (L13), pause the loop on a message without 'go' (R1), and return
+    the goal context (L4)."""
     settings = settings or Settings()
 
     def _pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = None,
@@ -1666,68 +1742,55 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
                         state.tool_calls_at_nudge = -1
                         store.save(state)
                     if state.go and state.unfinished():
-                        return _goal_context(state, f"[goal-loop] Goals of this chat at {time.strftime('%H:%M')} "
-                                            "(owner-approved; a newer goal list wins; "
-                                                    "do not change them without the owner):")
+                        context = _goals_context(state) + "\n\n" + LOOP_HINT
+                        if state.loop_note:
+                            context += "\n" + _LOOP_NOTE_LEAD + state.loop_note
+                        return context + _restart_note(store, state)
                 return None
             if not _is_owner_message(user_message, conversation_history):
                 return None
             gate = _gate_for(store, session_id, _.get("conversation_id"))
-            store.bump_gate(gate)
+            vocabulary = _vocabulary(store.base_dir)
+            go = _has_go(text, vocabulary[0])
+            if go:
+                store.bump_gate(gate)  # R1 c: only a 'go' message counts for goal_go
             store.bump_gate(gate, "change")
             store.open_gate(gate, f"boot{BOOT_ID[:12]}")
             _note_model(store, gate, model)
-            store.add_language_vote(gate, detect_language(text))
-            words = [str(w).lower() for w in (settings.get("stop_words") or [])]
-            if text.lower().strip(" .!") in words:
-                store.open_gate(gate, "stop")
-                # Apply it now: the pre_stop hook may not run again in this turn (the fork
-                # counter agent._pre_stop_nudges is not reset per turn).
-                if store.exists(gate):
-                    state = store.load(gate)
-                    _apply_owner_stop(store, state, gate,
-                                      _language(state, store, settings, gate))
+            if not store.exists(gate):
                 return None
-            key = gate
-            if not store.exists(key):
+            state = store.load(gate)
+            # Issue #1 and 0.4.2: an owner message starts a new count of idle turns and follow-up runs;
+            # 0.4.3: it lifts the block tries and the waits (the owner answered).
+            state.idle_nudges = 0
+            state.tool_calls_at_nudge = -1
+            state.idle_resumes = 0
+            state.tool_calls_at_resume = -1
+            for g in state.goals:
+                g.block_seq = -1
+            state.wait_reason = ""
+            state.stop_hold = ""
+            state.bg_wait = {}  # 0.4.7 (z5): the owner answered; the watchdog has nothing to do
+            _close_decisions(store, state, text, vocabulary)  # 0.4.7 (z3)
+            if go:
+                _lift_decision_wait(store, state, "owner_go")
+                if state.owner_paused:
+                    state.owner_paused = False
+                    if state.unfinished():
+                        state.go = True
+                        store.append_ledger(state.chat_key, "resumed_by_owner_go",
+                                            open=[g.id for g in state.unfinished()])
+                store.save(state)
+                if state.go and state.unfinished():
+                    return _goals_context(state) + "\n\n" + LOOP_HINT
                 return None
-            state = store.load(key)
-            if state.idle_nudges or state.tool_calls_at_nudge >= 0:
-                # Issue #1: an owner message starts a new round; idle turns of an earlier turn
-                # (for example one cut at the iteration limit) do not count into this one.
-                state.idle_nudges = 0
-                state.tool_calls_at_nudge = -1
-                store.save(state)
-            if state.wait_reason or any(g.block_seq >= 0 for g in state.goals) or state.stop_hold:
-                # 0.4.3: an owner message lifts every wait (the owner answered).
-                # 0.4.5 (r32): except the decision wait, when the message is a question.
-                state.wait_reason = ""
-                state.stop_hold = ""
-                if not state.decision_wait:
-                    state.decisions_at_nudge = len(state.decisions)
-                for g in state.goals:
-                    g.block_seq = -1
-                store.save(state)
-            if state.decision_wait:
-                if _answers_decision(text):
-                    _lift_decision_wait(store, state, "owner_answer")
-                else:
-                    store.append_ledger(state.chat_key, "owner_question_kept_wait")
-                store.save(state)
-            if _close_decisions(store, state, text):  # 0.4.7 (z3)
-                store.save(state)
-            if state.bg_wait:  # 0.4.7 (z5): the owner answered; the watchdog has nothing to do
-                state.bg_wait = {}
-                store.save(state)
-            if state.idle_resumes or state.tool_calls_at_resume >= 0:
-                # 0.4.2: an owner message starts a new count of idle follow-up runs.
-                state.idle_resumes = 0
-                state.tool_calls_at_resume = -1
-                store.save(state)
-            if state.go and state.unfinished() and text.lower().strip(" .!") not in words:
-                return _goal_context(state, f"[goal-loop] Goals of this chat at {time.strftime('%H:%M')} "
-                                            "(owner-approved; a newer goal list wins; "
-                                            "do not change them without the owner):")
+            if state.go and state.unfinished():
+                _pause_by_owner(store, state, gate)  # 0.4.10 (R1)
+                return (_goals_context(state) + "\n\n" + PAUSE_NOTE.format(
+                    n=len(state.unfinished()), gids=_ids(state.unfinished())) + " " + EVIDENCE_RULE)
+            if not state.decision_wait:
+                state.decisions_at_nudge = len(state.decisions)
+            store.save(state)
         except Exception:
             logger.debug("goal-loop pre_llm_call failed", exc_info=True)
         return None
@@ -1738,7 +1801,7 @@ def make_pre_llm_call(store: GoalStore, settings: Optional[Settings] = None):
 def make_pre_api_request(store: GoalStore, settings: Optional[Settings] = None):
     """0.4.4: count an owner message that interrupted a running turn. Hermes applies it as a user row
     with the api_content prefix _REDIRECT_PREFIX and does not start a new turn, so pre_llm_call does
-    not run for it. Each such row counts one time (go gate, change gate, stop word, wait lift)."""
+    not run for it. Each such row counts one time (go gate, change gate, owner pause, wait lift)."""
     settings = settings or Settings()
     inner = make_pre_llm_call(store, settings)
 
@@ -1877,7 +1940,6 @@ def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float
         open_goals = [g for g in state.unfinished() if g.status != "cancelled"]
         if not state.go or not open_goals:
             continue
-        lang = _language(state, store, settings, state.chat_key)
         gids = ", ".join(g.id for g in open_goals)
         age = int((now - os.path.getmtime(path)) // 86400)
         store.append_ledger(state.chat_key, "paused_stale", goal_ids=[g.id for g in open_goals],
@@ -1886,7 +1948,7 @@ def pause_stale_states(store: GoalStore, settings: Settings, now: Optional[float
             goal.status = "paused"
             goal.note = f"no activity for {age} days"
             goal.block_shown = False
-        state.decisions.append(_dtext(lang)["stale"].format(days=age, gids=gids))
+        state.decisions.append(DECISION_TEXT["stale"].format(days=age, gids=gids))
         state.go = False
         store.save(state)
         store.open_gate(state.chat_key)  # the next owner message counts for a new go
@@ -1914,8 +1976,8 @@ def register(ctx) -> None:
          ("Record the goals, each with one falsifiable check of the content, in the owner's language. "
           "Call before any goal work. The plugin shows the list and the go question.")),
         ("goal_go", _EMPTY_SCHEMA, tools.goal_go, "🟢",
-         ("Record the owner's go (also to resume paused goals). Call it only after the owner gave "
-          "the go in a new message; otherwise it is refused.")),
+         ("Record the owner's go (also to resume paused goals). Call it only after the owner wrote "
+          "'go' in a new message; otherwise it is refused.")),
         ("goal_status", _EMPTY_SCHEMA, tools.goal_status, "📋", GOAL_STATUS_DESCRIPTION),
         ("goal_claim", _GOAL_CLAIM_SCHEMA, tools.goal_claim, "✅",
          ("Submit a structured completion claim for one goal; a fresh-context judge verifies the "
@@ -1925,7 +1987,9 @@ def register(ctx) -> None:
         ("goal_progress", _GOAL_PROGRESS_SCHEMA, tools.goal_progress, "📍",
          "Record the last step, its evidence and the next step of a goal."),
         ("goal_decision", _GOAL_DECISION_SCHEMA, tools.goal_decision, "🧭",
-         "Record an owner decision (options + recommendation) for the decision list."),
+         ("Record an owner decision (options + recommendation) with the evidence of the live state. "
+          "Pass goal_id for the goal that waits for it; while other goals can be worked, it goes to the "
+          "deferred list and the loop continues.")),
         ("goal_block", _GOAL_BLOCK_SCHEMA, tools.goal_block, "⛔",
          ("Mark a goal blocked by an obstacle that stays (reason required). Accepted only when the "
           "same obstacle stays for several rounds; hard work is no blocker.")),

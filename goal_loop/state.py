@@ -25,8 +25,7 @@ loop).
 Small side files per **session id**: ``gate_<session>.json`` (the go gate: ``goal_set`` opens it with
 a count of 0, the ``pre_llm_call`` hook adds 1 for each owner message, ``goal_go`` needs at least 1),
 ``change_<session>.json`` (the same for a changed goal list after the go), ``sess_<session>.json``
-(the chat key of the session, for hooks that get only ``session_id``), ``lang_<session>.json``
-(owner language votes) and ``parent_<session>.json`` (E1 A: ``{"parent_session_id": ...}``, written by
+(the chat key of the session, for hooks that get only ``session_id``) and ``parent_<session>.json`` (E1 A: ``{"parent_session_id": ...}``, written by
 an importer such as owui-to-hermes; read only by the plugin).
 """
 from __future__ import annotations
@@ -43,27 +42,18 @@ GOAL_STATUS = ("open", "in_work", "waiting", "paused", "blocked", "done")
 OWNER_STATUSES = ("blocked", "paused")
 
 LABELS = {
-    "en": {
-        "title": "Goal status:", "title_owner": "Goal status (needs the owner):",
-        "closed": "Closed by your answer: {nums}",
-        "decisions": "Open decisions:", "check": "check", "go_question": "Do you give the go?",
-        "no_report": "(no final report from the model)", "progress": "progress",
-        "status": {"open": "open", "in_work": "in work", "waiting": "waiting", "paused": "paused",
-                   "blocked": "blocked", "done": "done"},
-    },
-    "de": {
-        "title": "Zielstatus:", "title_owner": "Zielstatus (braucht dich):",
-        "closed": "Mit deiner Antwort geschlossen: {nums}",
-        "decisions": "Offene Entscheidungen:", "check": "Prüfung", "go_question": "Gibst du das Go?",
-        "no_report": "(kein Abschlussbericht vom Modell)", "progress": "Fortschritt",
-        "status": {"open": "offen", "in_work": "in Arbeit", "waiting": "wartet", "paused": "pausiert",
-                   "blocked": "blockiert", "done": "erledigt"},
-    },
+    "title": "Goal status:", "title_owner": "Goal status (needs the owner):",
+    "closed": "Closed by your answer: {nums}",
+    "decisions": "Open decisions:", "check": "check", "go_question": "Do you give the go?",
+    "changes": "Pending change of the goal list (needs your approval):",
+    "no_report": "(no final report from the model)", "progress": "progress",
+    "status": {"open": "open", "in_work": "in work", "waiting": "waiting", "paused": "paused",
+               "blocked": "blocked", "done": "done"},
 }
 
 
-def labels(language: str) -> dict:
-    return LABELS.get(language or "en", LABELS["en"])
+def labels() -> dict:
+    return LABELS
 
 
 @dataclass
@@ -118,7 +108,6 @@ class GoalState:
     idle_nudges: int = 0
     nudge_seq: int = 0
     boot_id: str = ""
-    language: str = ""
     resumes: int = 0
     # 0.4.2: idle follow-up runs in a row (no tool call since the last follow-up run); only an
     # owner message resets it, so a chat that waits only for the owner pauses after a few runs.
@@ -144,6 +133,15 @@ class GoalState:
     # key that this state took the goals from.
     adopted_by: str = ""
     adopted_from: str = ""
+    # 0.4.10 (z13): an owner message without 'go' paused the loop (only a 'go' message resumes it).
+    owner_paused: bool = False
+    # 0.4.10 (z13): owner items held back while a goal can still be worked: {ts, kind, text, goal_id,
+    # number, shown}; kind is decision, block or change. Shown one time when no goal is free.
+    deferred: list[dict] = field(default_factory=list)
+    # 0.4.10 (z13): decision number (as text) -> the goal that waits for it.
+    decision_goals: dict = field(default_factory=dict)
+    # 0.4.10 (z13): the loop state at the end of the last turn, for the next follow-up turn (context).
+    loop_note: str = ""
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -169,7 +167,6 @@ class GoalState:
             idle_nudges=int(data.get("idle_nudges", 0)),
             nudge_seq=int(data.get("nudge_seq", 0)),
             boot_id=str(data.get("boot_id", "")),
-            language=str(data.get("language", "")),
             resumes=int(data.get("resumes", 0)),
             tool_calls_at_resume=int(data.get("tool_calls_at_resume", -1)),
             idle_resumes=int(data.get("idle_resumes", 0)),
@@ -184,6 +181,10 @@ class GoalState:
             last_model=str(data.get("last_model", "")),
             adopted_by=str(data.get("adopted_by", "")),
             adopted_from=str(data.get("adopted_from", "")),
+            owner_paused=bool(data.get("owner_paused", False)),
+            deferred=[dict(e) for e in data.get("deferred", []) if isinstance(e, dict)],
+            decision_goals={str(k): str(v) for k, v in dict(data.get("decision_goals") or {}).items()},
+            loop_note=str(data.get("loop_note", "")),
         )
 
     def goal(self, goal_id: str) -> Optional[Goal]:
@@ -192,10 +193,22 @@ class GoalState:
     def all_done(self) -> bool:
         return bool(self.goals) and all(g.done for g in self.goals)
 
+    def owner_bound(self, goal: Goal) -> bool:
+        """0.4.10 (z13): the goal waits for the owner: it is blocked or paused, or an open decision
+        is linked to it."""
+        if goal.status in OWNER_STATUSES:
+            return True
+        open_numbers = {str(i) for i, _ in self.open_decisions()}
+        return any(self.decision_goals.get(n) == goal.id for n in open_numbers)
+
+    def free_goals(self) -> list[Goal]:
+        """0.4.10 (z13): unfinished goals that do not wait for the owner (also goals that wait for
+        a judge effect, a background process or a delegation: they can go on later)."""
+        return [g for g in self.goals if not g.done and not self.owner_bound(g)]
+
     def open_goals(self) -> list[Goal]:
-        """Goals the loop must still work on: not confirmed, not waiting, not blocked or paused."""
-        return [g for g in self.goals
-                if not g.done and g.status not in OWNER_STATUSES and g.status != "waiting"]
+        """Goals the loop must still work on: not confirmed, not waiting, not owner-bound."""
+        return [g for g in self.free_goals() if g.status != "waiting"]
 
     def open_decisions(self) -> list[tuple[int, str]]:
         """0.4.7 (z3): (number, text) of the decisions that no owner answer closed."""
@@ -396,24 +409,9 @@ class GoalStore:
         key = data.get("chat_key") if data else None
         return key if isinstance(key, str) and key else None
 
-    # owner language votes per session
-    def add_language_vote(self, session_id: str, language: str) -> None:
-        if not session_id or not language:
-            return
-        data = self._read_side("lang", session_id) or {}
-        data[language] = int(data.get(language, 0)) + 1
-        self._write_side("lang", session_id, data)
 
-    def session_language(self, session_id: str) -> str:
-        data = self._read_side("lang", session_id) if session_id else None
-        if not data:
-            return ""
-        best = max(sorted(data), key=lambda k: int(data.get(k, 0)))
-        return best if int(data.get(best, 0)) > 0 else ""
-
-
-def _goal_line(goal: Goal, language: str = "en") -> str:
-    lab = labels(language)
+def _goal_line(goal: Goal) -> str:
+    lab = LABELS
     mark = "x" if goal.done else " "
     reason = f" — {goal.judge_reason}" if goal.judge_reason and not goal.done else ""
     if goal.status in OWNER_STATUSES and goal.note:
@@ -422,15 +420,15 @@ def _goal_line(goal: Goal, language: str = "en") -> str:
     return f"- [{mark}] {goal.id}: {goal.text} ({lab['check']}: {goal.check}) [{status}]{reason}"
 
 
-def status_block(state: GoalState, language: str = "en", go_question: bool = False) -> str:
+def status_block(state: GoalState, go_question: bool = False) -> str:
     """Render the full goal list: every goal with its check and status, then the decisions.
     ``go_question`` adds the go question as the last line (goal list before the go)."""
     if not state.goals:
         return ""
-    lab = labels(language)
+    lab = LABELS
     lines = ["", "---", lab["title"]]
     for goal in state.goals:
-        lines.append(_goal_line(goal, language))
+        lines.append(_goal_line(goal))
     if state.open_decisions():
         lines.append("")
         lines.append(lab["decisions"])
@@ -442,22 +440,27 @@ def status_block(state: GoalState, language: str = "en", go_question: bool = Fal
     return "\n".join(lines)
 
 
-def owner_block(blocked: list[Goal], decisions: list[tuple[int, str]], language: str = "en",
-                closed: Optional[list[int]] = None) -> str:
-    """Render only the items that need the owner: newly blocked or paused goals and new decisions;
-    0.4.8 (z10): with the numbers that the last owner message closed."""
-    if not blocked and not decisions and not closed:
+def owner_block(blocked: list[Goal], decisions: list[tuple[int, str]],
+                closed: Optional[list[int]] = None, changes: Optional[list[str]] = None) -> str:
+    """Render only the items that need the owner: newly blocked or paused goals, new decisions and
+    (0.4.10) pending changes of the goal list; 0.4.8 (z10): with the numbers that the last owner
+    message closed."""
+    if not blocked and not decisions and not closed and not changes:
         return ""
-    lab = labels(language)
+    lab = LABELS
     lines = ["", "---", lab["title_owner"]]
     if closed:
         lines.append(lab["closed"].format(nums=", ".join(str(i) for i in closed)))
     for goal in blocked:
-        lines.append(_goal_line(goal, language))
+        lines.append(_goal_line(goal))
     if decisions:
         if blocked:
             lines.append("")
         lines.append(lab["decisions"])
         for index, decision in decisions:
             lines.append(f"{index}. {decision}")
+    if changes:
+        lines.append("")
+        lines.append(lab["changes"])
+        lines.extend(f"- {text}" for text in changes)
     return "\n".join(lines)

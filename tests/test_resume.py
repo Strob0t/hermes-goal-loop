@@ -65,8 +65,8 @@ class ScheduleTest(Base):
     def test_a_run_that_ends_with_open_goals_schedules_one_follow_up_run(self):
         self.started()
         transform = make_transform_llm_output(self.store, Settings(self.ctx))
-        out = transform(response_text="ANSWER", **IDS)
-        self.assertIn("follow-up run", out)
+        transform(response_text="ANSWER", **IDS)
+        self.assertIn("follow-up run", self.store.load(_chat_key("c1")).loop_note)  # 0.4.10 (R3): context
         self.assertEqual(len(self.jobs.calls), 1)
         call = self.jobs.calls[0]
         self.assertTrue(call["no_agent"])
@@ -139,8 +139,8 @@ class ChainTest(Base):
         resume.mark(path, "running")  # resume_run.main before the post
         owner(self.store, resume.RESUME_PREFIX + first["nonce"] + "] Follow-up run")
         self.assertEqual(resume.load_request(path)["status"], "taken")
-        out = transform(response_text="B", **IDS)
-        self.assertIn("follow-up run", out)
+        transform(response_text="B", **IDS)
+        self.assertIn("follow-up run", self.store.load(_chat_key("c1")).loop_note)
         self.assertEqual(len(self.jobs.calls), 2)
         second = resume.load_request(path)
         self.assertNotEqual(second["nonce"], first["nonce"])
@@ -155,33 +155,34 @@ class ChainTest(Base):
 
 
 class StopWordCancelsTest(Base):
-    def test_a_stop_word_cancels_a_scheduled_follow_up_run(self):
+    def test_an_owner_message_cancels_a_scheduled_follow_up_run(self):
         from goal_loop import make_pre_stop
         self.started(("g1",))
         make_transform_llm_output(self.store, Settings(self.ctx))(response_text="A", **IDS)
-        owner(self.store, "stopp")
+        owner(self.store, "stop")
         make_pre_stop(self.store, Settings(self.ctx))(attempt=0, **IDS)
         request = resume.load_request(resume.request_path(self.store.base_dir, _chat_key("c1")))
         self.assertEqual(request["status"], "cancelled")
         self.assertFalse(self.store.load(_chat_key("c1")).go)
 
-    def test_the_stop_word_pauses_at_the_owner_message_without_pre_stop(self):
-        # Live 18:35: pre_stop did not run any more (fork counter used up), so the stop must act
-        # in pre_llm_call.
+    def test_an_owner_message_pauses_at_the_owner_message_without_pre_stop(self):
+        # Live 18:35: pre_stop did not run any more (fork counter used up), so the pause must act
+        # in pre_llm_call. 0.4.10 (R1): the paused turn gets a note for the model.
         self.started(("g1",))
         make_transform_llm_output(self.store, Settings(self.ctx))(response_text="A", **IDS)
-        out = owner(self.store, "stopp")
-        self.assertIsNone(out)
+        out = owner(self.store, "stop")
+        self.assertIn("paused the goal loop", out)
+        self.assertIn("Do not call goal_go", out)
         state = self.store.load(_chat_key("c1"))
         self.assertFalse(state.go)
         request = resume.load_request(resume.request_path(self.store.base_dir, _chat_key("c1")))
         self.assertEqual(request["status"], "cancelled")
         events = [e["event"] for e in self.store.read_ledger(_chat_key("c1"))]
-        self.assertEqual(events.count("paused_by_owner"), 1)
+        self.assertEqual(events.count("paused_by_owner_message"), 1)
         from goal_loop import make_pre_stop
         self.assertIsNone(make_pre_stop(self.store, Settings(self.ctx))(attempt=0, **IDS))
         events = [e["event"] for e in self.store.read_ledger(_chat_key("c1"))]
-        self.assertEqual(events.count("paused_by_owner"), 1)
+        self.assertEqual(events.count("paused_by_owner_message"), 1)
 
 
 class FollowUpIsNoOwnerMessageTest(Base):

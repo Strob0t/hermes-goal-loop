@@ -75,7 +75,7 @@ class DecisionAfterFinalListTest(unittest.TestCase):
         t.goal_go({}, **ids)
         t.goal_claim({"goal_id": "g1", "claim": {"summary": "s", **CHECKS}}, **ids)
         self.assertIn("- [x] g1", transform(response_text="FINAL", **ids))
-        t.goal_decision({"text": "Follow-up: A, B or C. Recommend A."}, **ids)
+        t.goal_decision({"text": "Follow-up: A, B or C. Recommend A.", "evidence": "ls -l /tmp at 09:00, exit 0"}, **ids)
         out = transform(response_text="LATER", **ids)
         self.assertIn("Follow-up: A, B or C", out)
         self.assertNotIn("- [x] g1", out)

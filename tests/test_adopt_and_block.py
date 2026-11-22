@@ -16,7 +16,7 @@ class AdoptParentTest(unittest.TestCase):
     def _old(self, store, key="chat:old", go=True):
         state = GoalState(chat_key=key, go=go,
                           goals=[Goal(id="v1", text="alt", check="c"),
-                                 Goal(id="v2", text="fertig", check="c", done=True, status="done")])
+                                 Goal(id="v2", text="complete", check="c", done=True, status="done")])
         store.save(state)
         return state
 
@@ -94,9 +94,10 @@ class BlockShownOnceTest(unittest.TestCase):
         ctx = Ctx(settings={"block_min_rounds": 1})
         s = Settings(ctx)
         tools = _Tools(store, ctx, s)
-        set_and_go(tools, store, goals=(("g1", "a", "c1"), ("g2", "b", "c2")))
+        # 0.4.10 (R2): one goal only, so that its block is owner-bound and not deferred
+        set_and_go(tools, store, goals=(("g1", "a", "c1"),))
         tools.goal_block({"goal_id": "g1", "reason": reason}, **IDS)
-        out = make_transform_llm_output(store, s)(response_text="Bericht.", **IDS)
+        out = make_transform_llm_output(store, s)(response_text="Report.", **IDS)
         return tools, store, s, out
 
     def test_the_first_block_is_shown(self):
@@ -105,22 +106,22 @@ class BlockShownOnceTest(unittest.TestCase):
 
     def test_the_same_reason_again_is_not_shown_again(self):
         tools, store, s, _ = self._blocked("docker.sock permission denied on homeserver")
-        owner(store, "weiter", settings=s)
+        owner(store, "go", settings=s)
         tools.goal_block({"goal_id": "g1", "reason": "docker.sock permission denied on homeserver again"},
                          **IDS)
         state = store.load(tools._load(IDS).chat_key)
         self.assertTrue(state.goal("g1").block_shown)
-        out = make_transform_llm_output(store, s)(response_text="Bericht zwei.", **IDS)
-        self.assertNotIn("g1:", out)
+        out = make_transform_llm_output(store, s)(response_text="Report two.", **IDS)
+        self.assertNotIn("g1:", out or "")
         self.assertFalse(store.read_ledger(state.chat_key)[-1]["shown_again"])
 
     def test_a_new_reason_shows_the_goal_again(self):
         tools, store, s, _ = self._blocked("docker.sock permission denied on homeserver")
-        owner(store, "weiter", settings=s)
+        owner(store, "go", settings=s)
         tools.goal_block({"goal_id": "g1", "reason": "GitHub token expired, push refused with 401"}, **IDS)
         state = store.load(tools._load(IDS).chat_key)
         self.assertFalse(state.goal("g1").block_shown)
-        out = make_transform_llm_output(store, s)(response_text="Bericht zwei.", **IDS)
+        out = make_transform_llm_output(store, s)(response_text="Report two.", **IDS)
         self.assertIn("g1:", out)
         self.assertIn("GitHub token expired", out)
 

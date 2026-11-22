@@ -4,7 +4,7 @@ import unittest
 
 from goal_loop import (
     BOOT_ID, CHANGE_REFUSED, GO_REFUSED, USAGE_HINT, Settings, _JUDGE_PARENTS, _Tools, _chat_key,
-    detect_language, make_post_tool_call, make_pre_llm_call, make_pre_stop, make_pre_tool_call,
+    make_post_tool_call, make_pre_llm_call, make_pre_stop, make_pre_tool_call,
     make_transform_llm_output,
 )
 import goal_loop
@@ -163,6 +163,17 @@ class L3ChangeTest(unittest.TestCase):
         set_and_go(tools, store, (("g1", "a", "c1"), ("g2", "b", "c2")))
         claim(tools, "g1")
         out = tools.goal_set({"goals": [{"id": "g2", "text": "other", "check": "x"}]}, **IDS)
+        self.assertIn("recorded in the deferred list", out)  # 0.4.10: g2 can still be worked
+        state = store.load(_chat_key("s1"))
+        self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
+        self.assertEqual(state.goal("g2").text, "b")
+
+    def test_goal_set_after_go_without_a_free_goal_is_refused(self):
+        tools, store, _, _ = setup(block_min_rounds=1)
+        set_and_go(tools, store, (("g1", "a", "c1"), ("g2", "b", "c2")))
+        claim(tools, "g1")
+        tools.goal_block({"goal_id": "g2", "reason": "the host is down"}, **IDS)
+        out = tools.goal_set({"goals": [{"id": "g2", "text": "other", "check": "x"}]}, **IDS)
         self.assertEqual(out, CHANGE_REFUSED)
         state = store.load(_chat_key("s1"))
         self.assertEqual([g.id for g in state.goals], ["g1", "g2"])
@@ -173,7 +184,7 @@ class L3ChangeTest(unittest.TestCase):
         set_and_go(tools, store, (("g1", "a", "c1"), ("g2", "b", "c2")))
         claim(tools, "g1")
         tools.goal_set({"goals": [{"id": "g2", "text": "other", "check": "x"}]}, **IDS)
-        owner(store, "ja, ändere g2")
+        owner(store, "yes, change g2, go")
         tools.goal_set({"goals": [{"id": "g1", "text": "CHANGED", "check": "x"},
                                   {"id": "g2", "text": "other", "check": "x"}]}, **IDS)
         state = store.load(_chat_key("s1"))
@@ -186,13 +197,13 @@ class L3ChangeTest(unittest.TestCase):
 class L4ContextTest(unittest.TestCase):
     def test_owner_turn_gets_the_open_goals_with_text_check_and_progress(self):
         tools, store, _, s = setup()
-        set_and_go(tools, store, (("g1", "Bericht schreiben", "Datei hat 5 Abschnitte"),))
-        tools.goal_progress({"goal_id": "g1", "step": "Abschnitt 1", "next": "Abschnitt 2"}, **IDS)
-        ctx = owner(store, "weiter", settings=s)
+        set_and_go(tools, store, (("g1", "write the report", "the file has 5 sections"),))
+        tools.goal_progress({"goal_id": "g1", "step": "section 1", "next": "section 2"}, **IDS)
+        ctx = owner(store, "go", settings=s)
         self.assertIn("g1", ctx)
-        self.assertIn("Bericht schreiben", ctx)
-        self.assertIn("check: Datei hat 5 Abschnitte", ctx)
-        self.assertIn("next: Abschnitt 2", ctx)
+        self.assertIn("write the report", ctx)
+        self.assertIn("check: the file has 5 sections", ctx)
+        self.assertIn("next: section 2", ctx)
 
     def test_no_context_before_the_go_or_after_all_done(self):
         tools, store, _, s = setup()
@@ -251,12 +262,13 @@ class L8StopWordTest(unittest.TestCase):
         set_and_go(tools, store)
         tool(store)
         self.assertIsNotNone(stop(store, s))
-        owner(store, "Stopp!", settings=s)
+        owner(store, "Stop!", settings=s)
         self.assertIsNone(stop(store, s))
         self.assertFalse(store.load(_chat_key("s1")).go)
-        self.assertEqual(store.read_ledger(_chat_key("s1"))[-1]["event"], "paused_by_owner")
-        owner(store, "go", settings=s)
-        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go recorded"))
+        self.assertIn("paused_by_owner_message", [e["event"] for e in store.read_ledger(_chat_key("s1"))])
+        owner(store, "go", settings=s)  # 0.4.10 (R1): the go message itself gives the go again
+        self.assertTrue(store.load(_chat_key("s1")).go)
+        self.assertTrue(tools.goal_go({}, **IDS).startswith("Go already recorded"))
 
 
 class L9WaitTest(unittest.TestCase):
@@ -353,21 +365,19 @@ class L13RestartTest(unittest.TestCase):
         store.close_gate(_chat_key("s1"), f"boot{BOOT_ID[:12]}")  # gate keyed on the chat (2a)
         self.assertIsNone(stop(store, s))
         self.assertEqual(store.read_ledger(_chat_key("s1"))[-1]["event"], "restart_hold")
-        owner(store, "weiter", settings=s)
+        owner(store, "go", settings=s)
         self.assertEqual(stop(store, s)["action"], "continue")
 
 
 class L15PausedLineTest(unittest.TestCase):
-    def test_an_answer_with_open_goals_after_the_go_gets_the_paused_line(self):
+    def test_an_answer_with_open_goals_after_the_go_records_the_paused_note_as_context(self):
+        # 0.4.10 (R3): the loop state is a note for the model, not a fixed line in the answer.
         tools, store, _, s = setup()
         set_and_go(tools, store)
         transform = make_transform_llm_output(store, s)
         transform(response_text="x", **IDS)
-        out = transform(response_text="Zwischenstand", **IDS)
-        self.assertIn("goal(s) are open (g1)", out)
-        owner(store, "Das ist ein deutscher Satz und er ist lang genug für die Sprache", settings=s)
-        out = transform(response_text="Zwischenstand", **IDS)
-        self.assertIn("Schreibe 'weiter'", out)
+        self.assertIsNone(transform(response_text="Interim report", **IDS))
+        self.assertIn("goal(s) are open (g1)", store.load(_chat_key("s1")).loop_note)
 
 
 class L16ProgressTest(unittest.TestCase):
@@ -402,31 +412,18 @@ class L17RejectTest(unittest.TestCase):
 class O1O2OutputTest(unittest.TestCase):
     def test_goal_set_reply_has_no_list_and_the_block_has_the_go_question_once(self):
         tools, store, _, s = setup()
-        out = tools.goal_set({"goals": [{"id": "g1", "text": "Ziel eins", "check": "Prüfung"}]}, **IDS)
-        self.assertNotIn("Ziel eins", out)
-        answer = make_transform_llm_output(store, s)(response_text="Kurz: ein Ziel.", **IDS)
+        out = tools.goal_set({"goals": [{"id": "g1", "text": "goal one", "check": "check one"}]}, **IDS)
+        self.assertNotIn("goal one", out)
+        answer = make_transform_llm_output(store, s)(response_text="Short: one goal.", **IDS)
         self.assertEqual(answer.count("g1:"), 1)
         self.assertTrue(answer.rstrip().endswith("Do you give the go?"))
 
-    def test_labels_follow_the_owner_language(self):
+    def test_labels_are_english(self):
         tools, store, _, s = setup()
-        owner(store, "Bitte prüfe das und schreibe mir dann einen Bericht, wie es läuft", settings=s)
-        tools.goal_set({"goals": [{"id": "g1", "text": "Ziel", "check": "Prüfung"}]}, **IDS)
-        answer = make_transform_llm_output(store, s)(response_text="Kurz.", **IDS)
-        self.assertIn("Zielstatus:", answer)
-        self.assertIn("(Prüfung: Prüfung) [offen]", answer)
-        self.assertTrue(answer.rstrip().endswith("Gibst du das Go?"))
-
-    def test_language_setting_overrides_detection(self):
-        tools, store, _, s = setup(language="en")
-        owner(store, "Bitte prüfe das und schreibe mir dann einen Bericht", settings=s)
-        tools.goal_set({"goals": [{"id": "g1", "text": "Ziel", "check": "P"}]}, **IDS)
-        self.assertIn("Goal status:", make_transform_llm_output(store, s)(response_text="x", **IDS))
-
-    def test_detect_language(self):
-        self.assertEqual(detect_language("Das ist nicht so, wie ich es will"), "de")
-        self.assertEqual(detect_language("Please check this and tell me what is wrong"), "en")
-        self.assertEqual(detect_language("go"), "")
+        tools.goal_set({"goals": [{"id": "g1", "text": "goal", "check": "a check"}]}, **IDS)
+        answer = make_transform_llm_output(store, s)(response_text="Short.", **IDS)
+        self.assertIn("Goal status:", answer)
+        self.assertIn("(check: a check) [open]", answer)
 
 
 class O3O5HintTest(unittest.TestCase):
