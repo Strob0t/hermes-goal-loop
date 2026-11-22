@@ -1,5 +1,10 @@
 """hermes-goal-loop: a goal loop for Hermes as a plugin (v0.3).
 
+0.4.12 (z15): background watchdog. A tool call creates the turn mark when it is absent (a turn that
+started before a plugin reload), so the watchdog does not continue a chat while that turn runs. A wait
+for a process id that is not stored starts a new wait (only the awaited ids, a new start time); the
+same set or a subset keeps the start time, so ``background_wait_max`` counts from the newest process.
+
 0.4.11 (z14): owner language. The plugin appends no text to the answer (``transform_llm_output``
 returns None). What the owner must see (the goal list after ``goal_set``, goals that need the owner,
 open decisions, the deferred list, the numbers just closed, the final list), each one time, goes into
@@ -924,13 +929,19 @@ def _process_running(proc_id: str) -> bool:
 
 
 def _note_background(state: "GoalState", session_id: str, platform: str) -> None:
-    """0.4.7 (z5): remember the awaited processes (the first time of this wait keeps 'since')."""
+    """0.4.7 (z5): remember the awaited processes. 0.4.12 (z15): a process id that is not stored starts a
+    new wait (only the awaited ids, 'since' = now); the same set or a subset keeps the stored wait."""
     procs = _awaited_processes(session_id)
     if not procs:
         return
-    ids = sorted(set(state.bg_wait.get("procs", [])) | {p["id"] for p in procs})
+    stored = set(state.bg_wait.get("procs", []))
+    awaited = {p["id"] for p in procs}
+    since = state.bg_wait.get("since")
+    if awaited - stored or not since:
+        stored, since = awaited, time.time()
+    ids = sorted(stored)
     keys = [p["session_key"] for p in procs if p["session_key"]]
-    state.bg_wait = {"procs": ids, "since": state.bg_wait.get("since") or time.time(),
+    state.bg_wait = {"procs": ids, "since": since,
                      "session": str(session_id), "platform": str(platform or ""),
                      "session_key": keys[0] if keys else state.bg_wait.get("session_key", "")}
 
@@ -956,12 +967,9 @@ def _mark_turn(*keys: Any, now: Optional[float] = None) -> None:
 
 
 def _touch_turn(*keys: Any) -> None:
-    """Refresh the mark of a turn that runs (tool calls), so a long turn is not taken as stale."""
-    marks = _turn_marks()
-    t = time.time()
-    for k in keys:
-        if k and str(k) in marks:
-            marks[str(k)] = t
+    """Refresh the mark of a turn that runs (tool calls), so a long turn is not taken as stale. 0.4.12
+    (z15): create an absent mark (a turn that started before a plugin reload has none)."""
+    _mark_turn(*keys)
 
 
 def _end_turn(*keys: Any) -> None:

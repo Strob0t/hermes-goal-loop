@@ -34,6 +34,13 @@ patch the plugin's tools still work and the hook is simply never called.
    recommendation); the chat shows the decisions as a numbered text list — no card, no
    modal.
 
+## Background watchdog (0.4.12)
+
+A tool call creates the turn mark when it is absent (a turn that started before a plugin
+reload), so the watchdog does not continue a chat while that turn runs. A wait for a new
+process id starts a new wait time with only the awaited ids; the same set or a subset keeps
+the start time.
+
 ## Owner language (0.4.11)
 
 The plugin appends no text to the answer: `transform_llm_output` returns None. All plugin
