@@ -356,3 +356,5 @@ PYTHONPATH=<this repo> GOAL_LOOP_STATE_DIR=<tmp> python -m unittest integration.
 
 Plugin code: see repository licence. Parts of the completion-claim validation are ported
 from `william-ricchiuti/OpenCode-goal-plugin` (MIT) — see `THIRD_PARTY.md`.
+
+<!-- gh6 test of the PR check path, 2026-11-23. This PR is closed after the test. -->
